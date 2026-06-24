@@ -27,7 +27,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "PI_XAI_SIDE_TOOLS=0 tsx --test test/helpers.test.ts",
+    "test": "PI_XAI_SIDE_TOOLS=0 tsx --test test/*.test.ts",
     "smoke": "PI_XAI_SIDE_TOOLS=0 tsx test/smoke.ts",
     "prepack": "npm run build"
   },

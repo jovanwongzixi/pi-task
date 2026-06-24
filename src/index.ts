@@ -1,7 +1,7 @@
 /**
  * Task Tool — Delegate complex work to specialist agents.
  *
- * Spawns pi CLI in a tmux split pane (so you can watch it live) and
+ * Spawns Pi CLI in a Herdr or tmux split pane (so you can watch it live) and
  * detects completion via RESULT.md polling. On completion, tool call
  * count and duration are reported as a notification.
  *
@@ -15,7 +15,6 @@
  *     detection, 30-minute timeout.
  */
 
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
@@ -42,8 +41,6 @@ import {
   TASK_BACKGROUND_DEFAULT,
   TASK_RESULT_XML_INSTRUCTIONS,
   TASK_TOOL_DESCRIPTION,
-  buildTmuxSplitWindowArgs,
-  chooseTmuxSplitDirection,
   formatBackgroundReceipt,
   buildPiArgs,
   parseResultXml,
@@ -55,6 +52,13 @@ import {
   readRecentToolCalls,
 } from "./helpers.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
+import {
+  type SubagentBackendName,
+  type SubagentPaneBackend,
+  selectSubagentBackend,
+} from "./subagent/backend.js";
+import { HerdrBackend } from "./subagent/herdr.js";
+import { TmuxBackend } from "./subagent/tmux.js";
 import {
   type TaskCompletionSnapshot,
   checkTaskCompletion,
@@ -77,10 +81,17 @@ const BACKGROUND_CHECK_MS = 10_000; // poll every 10 sec
 const COUNT_POLL_MS = 3_000; // update toolcall counts every 3 sec
 const TASK_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
 const MAX_POLL_ERRORS = 3; // consecutive poll failures before giving up on a task
+const tmuxBackend = new TmuxBackend();
+const herdrBackend = new HerdrBackend();
+const paneBackends: readonly SubagentPaneBackend[] = [
+  herdrBackend,
+  tmuxBackend,
+];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface BackgroundTask {
+  backend: SubagentBackendName;
   dir: string;
   agentType: string;
   sessionName: string;
@@ -109,6 +120,7 @@ interface RegistryEntry {
   dir: string;
   conversationId?: string;
   sessionRef?: string;
+  backend?: SubagentBackendName;
 }
 
 /** Durable task→session mapping used for resume after task completion. */
@@ -136,6 +148,10 @@ interface TaskDetails {
   tool_uses?: number;
   // Background
   background?: boolean;
+  backend?: SubagentBackendName;
+  pane_id?: string;
+  session_name?: string;
+  /** @deprecated Retained when reading older tool results. */
   tmux_session?: string;
 }
 
@@ -255,93 +271,21 @@ function findJsonlSessionByName(
   return undefined;
 }
 
-// ─── Tmux Helpers ────────────────────────────────────────────────────────────
-
-function tmuxCmd(args: string[]): string {
-  return execFileSync("tmux", args, {
-    encoding: "utf-8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+function getPaneBackend(
+  backend: SubagentBackendName | undefined,
+): SubagentPaneBackend | undefined {
+  if (backend === "herdr") return herdrBackend;
+  if (backend === "tmux" || backend === undefined) return tmuxBackend;
+  return undefined;
 }
 
-function hasTmux(): boolean {
-  try {
-    execFileSync("tmux", ["-V"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+function registryPaneIsAlive(entry: RegistryEntry): boolean {
+  if (!entry.paneId) return false;
+  return getPaneBackend(entry.backend)?.exists(entry.paneId) ?? false;
 }
 
-function paneExists(paneId: string): boolean {
-  try {
-    return tmuxCmd(["list-panes", "-a", "-F", "#{pane_id}"])
-      .split("\n")
-      .includes(paneId);
-  } catch {
-    return false;
-  }
-}
-
-function getCurrentPaneId(): string | null {
-  try {
-    return tmuxCmd(["display-message", "-p", "#{pane_id}"]);
-  } catch {
-    return null;
-  }
-}
-
-function getCurrentPaneSize(
-  targetPane?: string | null,
-): { width: number; height: number } | null {
-  try {
-    const args = ["display-message", "-p", "#{pane_width} #{pane_height}"];
-    if (targetPane) args.splice(1, 0, "-t", targetPane);
-    const raw = tmuxCmd(args);
-    const [widthRaw, heightRaw] = raw.trim().split(/\s+/, 2);
-    const width = Number(widthRaw);
-    const height = Number(heightRaw);
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
-    return { width, height };
-  } catch {
-    return null;
-  }
-}
-
-function splitWindowPane(
-  cwd: string,
-  command: string,
-): { paneId: string; originalPane: string | null } {
-  const originalPane = getCurrentPaneId();
-  const paneSize = getCurrentPaneSize(originalPane);
-  const direction = chooseTmuxSplitDirection(
-    paneSize?.width ?? 0,
-    paneSize?.height ?? 0,
-  );
-  const paneId = tmuxCmd(
-    buildTmuxSplitWindowArgs(cwd, command, direction, originalPane),
-  );
-  return { paneId, originalPane };
-}
-
-function killAgentPane(
-  paneId: string | undefined,
-  originalPane: string | null,
-): void {
-  if (paneId) {
-    try {
-      if (paneExists(paneId)) tmuxCmd(["kill-pane", "-t", paneId]);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (originalPane) {
-    try {
-      tmuxCmd(["select-pane", "-t", originalPane]);
-    } catch {
-      /* ignore */
-    }
-  }
+function killTaskPane(task: BackgroundTask): void {
+  getPaneBackend(task.backend)?.kill(task.paneId, task.originalPane);
 }
 
 // ─── Process a completed task (sendMessage + registry cleanup) ──────────────
@@ -354,8 +298,7 @@ function completeTask(
   phase: "done" | "timeout" | "failed",
   piDir: string,
 ): void {
-  // Kill the tmux pane if still alive
-  killAgentPane(task.paneId, task.originalPane);
+  killTaskPane(task);
 
   const parsed = parseResultXml(content);
   const durationMs = Date.now() - task.startedAt;
@@ -370,6 +313,7 @@ function completeTask(
     agentType: task.agentType,
     description: task.description,
     sessionName: task.sessionName,
+    backend: task.backend,
     startedAt: task.startedAt,
     paneId: task.paneId,
     piDir,
@@ -397,6 +341,9 @@ function completeTask(
         summary: parsed.summary,
         findings: parsed.findings,
         confidence: parsed.confidence,
+        backend: task.backend,
+        pane_id: task.paneId,
+        session_name: task.sessionName,
         duration_ms: durationMs,
         tool_uses: task.toolUses,
         turn_count: task.turns,
@@ -435,14 +382,14 @@ export default function (pi: ExtensionAPI) {
       continue;
     }
 
-    // Check if tmux pane is still alive
-    const paneAlive = entry.paneId ? paneExists(entry.paneId) : false;
+    const paneAlive = registryPaneIsAlive(entry);
     if (!paneAlive) {
       staleIds.push(entry.id);
       continue;
     }
 
     const bgtask: BackgroundTask = {
+      backend: entry.backend ?? "tmux",
       dir: entry.dir,
       agentType: entry.agentType,
       sessionName: entry.sessionName,
@@ -582,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 
         // ── Check timeout ────────────────────────────────────────────
         if (now - task.startedAt > TASK_TIMEOUT_MS) {
-          killAgentPane(task.paneId, task.originalPane);
+          killTaskPane(task);
           backgroundTasks.delete(id);
           clearTaskWidgetIfIdle();
           completeTask(
@@ -596,6 +543,10 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
 
+        // SDK tasks complete through their in-process promise below. They stay
+        // in this map for widget/timeout tracking, but have no pane to poll.
+        if (task.backend === "sdk") continue;
+
         // A transient fs error here (RESULT.md mid-write, EACCES, dir briefly
         // missing) must NOT drop the task. Keep it tracked and retry on the
         // next tick; only give up after repeated failures (the timeout above
@@ -607,12 +558,14 @@ export default function (pi: ExtensionAPI) {
             sessionDir: join(task.dir, "sessions"),
             sessionName: task.sessionName,
             paneId: task.paneId,
+            paneExists: (candidatePaneId) =>
+              getPaneBackend(task.backend)?.exists(candidatePaneId) ?? false,
             sinceMs: task.startedAt,
           });
         } catch (err) {
           task.pollErrors = (task.pollErrors ?? 0) + 1;
           if (task.pollErrors >= MAX_POLL_ERRORS) {
-            killAgentPane(task.paneId, task.originalPane);
+            killTaskPane(task);
             backgroundTasks.delete(id);
             clearTaskWidgetIfIdle();
             const message = err instanceof Error ? err.message : String(err);
@@ -755,6 +708,21 @@ export default function (pi: ExtensionAPI) {
           default: true,
         }),
       ),
+      backend: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("auto"),
+            Type.Literal("herdr"),
+            Type.Literal("tmux"),
+            Type.Literal("sdk"),
+          ],
+          {
+            description:
+              "Execution backend. auto prefers herdr inside Herdr, then tmux, then SDK.",
+            default: "auto",
+          },
+        ),
+      ),
     }),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -866,9 +834,10 @@ export default function (pi: ExtensionAPI) {
         if (
           params.background !== false &&
           entry?.paneId &&
-          paneExists(entry.paneId)
+          registryPaneIsAlive(entry)
         ) {
           const bgtask: BackgroundTask = {
+            backend: entry.backend ?? "tmux",
             dir: artifactsDir,
             agentType: entry.agentType,
             sessionName,
@@ -895,7 +864,9 @@ export default function (pi: ExtensionAPI) {
               agent_type: agent.name,
               description: params.description,
               conversation_id: conversationId,
-              tmux_session: sessionName,
+              backend: entry.backend ?? "tmux",
+              pane_id: entry.paneId,
+              session_name: sessionName,
               background: true,
             },
           };
@@ -970,9 +941,10 @@ export default function (pi: ExtensionAPI) {
         if (
           params.background !== false &&
           entry.paneId &&
-          paneExists(entry.paneId)
+          registryPaneIsAlive(entry)
         ) {
           const bgtask: BackgroundTask = {
+            backend: entry.backend ?? "tmux",
             dir: artifactsDir,
             agentType: entry.agentType,
             sessionName,
@@ -999,7 +971,9 @@ export default function (pi: ExtensionAPI) {
               agent_type: entry.agentType,
               description: params.description || entry.description,
               conversation_id: entry.conversationId ?? conversationId,
-              tmux_session: sessionName,
+              backend: entry.backend ?? "tmux",
+              pane_id: entry.paneId,
+              session_name: sessionName,
               background: true,
             },
           };
@@ -1026,17 +1000,35 @@ export default function (pi: ExtensionAPI) {
         resultPath = join(artifactsDir, `RESULT-${id}.md`);
       }
 
-      if (conversationId && !hasTmux()) {
+      let backendSelection;
+      try {
+        backendSelection = selectSubagentBackend(
+          params.backend ?? "auto",
+          paneBackends,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: message }],
+          details: {
+            phase: "failed" as const,
+            error: message,
+          },
+          isError: true,
+        };
+      }
+
+      if ((conversationId || resume) && backendSelection.name === "sdk") {
         return {
           content: [
             {
               type: "text" as const,
-              text: "Durable conversations require the tmux/CLI backend so Pi can save and reopen the subagent session. Install/start tmux or omit conversation_id for a one-shot SDK task.",
+              text: "Resuming saved sessions requires the herdr or tmux CLI backend so Pi can reopen the subagent session. Select an available pane backend, or use SDK only for a new one-shot task.",
             },
           ],
           details: {
             phase: "failed" as const,
-            error: "tmux required for durable conversation",
+            error: "CLI pane backend required for session resume",
             conversation_id: conversationId,
           },
           isError: true,
@@ -1114,6 +1106,7 @@ export default function (pi: ExtensionAPI) {
       const foregroundTask: BackgroundTask | undefined = isBackground
         ? undefined
         : {
+            backend: backendSelection.name,
             dir: artifactsDir,
             agentType: agent.name,
             sessionName,
@@ -1131,10 +1124,10 @@ export default function (pi: ExtensionAPI) {
         ensureTaskWidget(ctx);
       }
 
-      // Prefer tmux for observability, but fall back to the SDK in headless/CI/RPC.
-      if (!hasTmux()) {
+      if (backendSelection.name === "sdk") {
         if (isBackground) {
           const bgtask: BackgroundTask = {
+            backend: "sdk",
             dir: artifactsDir,
             agentType: agent.name,
             sessionName,
@@ -1157,6 +1150,7 @@ export default function (pi: ExtensionAPI) {
             piDir,
             dir: artifactsDir,
             conversationId,
+            backend: "sdk",
           };
 
           const entries = readRegistry(piDir);
@@ -1172,16 +1166,16 @@ export default function (pi: ExtensionAPI) {
 
           void runSdkFallback()
             .then(async ({ output }) => {
+              if (!backgroundTasks.delete(id)) return;
               const finalOutput =
                 output || "SDK subagent completed without assistant text.";
-              backgroundTasks.delete(id);
               clearTaskWidgetIfIdle();
               completeTask(pi, id, bgtask, finalOutput, "done", piDir);
             })
             .catch((error) => {
+              if (!backgroundTasks.delete(id)) return;
               const message =
                 error instanceof Error ? error.message : String(error);
-              backgroundTasks.delete(id);
               clearTaskWidgetIfIdle();
               completeTask(
                 pi,
@@ -1197,13 +1191,22 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text" as const,
-                text: `Task ${id} started with SDK backend (tmux unavailable).`,
+                text: formatBackgroundReceipt({
+                  taskId: id,
+                  agentType: agent.name,
+                  backend: "sdk",
+                  sessionName,
+                  artifactDir: artifactsDir,
+                }),
               },
             ],
             details: {
               task_id: id,
+              agent_type: agent.name,
+              description: descText,
               background: true,
               backend: "sdk" as const,
+              session_name: sessionName,
               result_path: resultPath,
               conversation_id: conversationId,
             },
@@ -1256,31 +1259,37 @@ export default function (pi: ExtensionAPI) {
       }
 
       const shellCommand = `${envPrefix} pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+      const paneBackend = backendSelection.paneBackend;
+      if (!paneBackend) {
+        throw new Error(`Missing pane backend for ${backendSelection.name}.`);
+      }
 
       let paneId: string;
       let originalPane: string | null;
       try {
-        const splitResult = splitWindowPane(
-          ctx.cwd,
-          `cd ${shellQuote(ctx.cwd)} && ${shellCommand}`,
-        );
+        const splitResult = paneBackend.spawn({
+          cwd: ctx.cwd,
+          command: shellCommand,
+          description: descText,
+        });
         paneId = splitResult.paneId;
         originalPane = splitResult.originalPane;
         if (foregroundTask) {
           foregroundTask.paneId = paneId;
           foregroundTask.originalPane = originalPane;
         }
-      } catch {
+      } catch (error) {
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
+        const message = error instanceof Error ? error.message : String(error);
         return {
           content: [
             {
               type: "text" as const,
-              text: "Failed to create tmux split pane for the agent.",
+              text: `Failed to create ${backendSelection.name} pane for the agent: ${message}`,
             },
           ],
-          details: { phase: "failed" as const, error: "tmux split failed" },
+          details: { phase: "failed" as const, error: message },
           isError: true,
         };
       }
@@ -1293,6 +1302,7 @@ export default function (pi: ExtensionAPI) {
           agentType: agent.name,
           description: descText,
           sessionName,
+          backend: backendSelection.name,
           startedAt,
           paneId,
           piDir,
@@ -1307,6 +1317,8 @@ export default function (pi: ExtensionAPI) {
           sessionDir,
           sessionName,
           paneId,
+          paneExists: (candidatePaneId) =>
+            paneBackend.exists(candidatePaneId),
           signal,
           timeoutMs: TASK_TIMEOUT_MS,
           pollMs: 1000,
@@ -1329,6 +1341,7 @@ export default function (pi: ExtensionAPI) {
           agentType: agent.name,
           description: descText,
           sessionName,
+          backend: backendSelection.name,
           startedAt,
           paneId,
           piDir,
@@ -1339,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
           completedAt: Date.now(),
           background: false,
         });
-        killAgentPane(paneId, originalPane);
+        paneBackend.kill(paneId, originalPane);
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
 
@@ -1386,6 +1399,9 @@ export default function (pi: ExtensionAPI) {
             tool_uses: toolUses,
             turn_count: turns,
             background: false,
+            backend: backendSelection.name,
+            pane_id: paneId,
+            session_name: sessionName,
             conversation_id: conversationId,
           },
         };
@@ -1394,6 +1410,7 @@ export default function (pi: ExtensionAPI) {
       // ── BACKGROUND MODE (default): add to tracker, return immediately ─────
 
       const bgtask: BackgroundTask = {
+        backend: backendSelection.name,
         dir: artifactsDir,
         agentType: agent.name,
         sessionName,
@@ -1420,6 +1437,7 @@ export default function (pi: ExtensionAPI) {
         piDir,
         dir: artifactsDir,
         conversationId,
+        backend: backendSelection.name,
       };
 
       // Write to JSON registry for on-load restore
@@ -1439,7 +1457,7 @@ export default function (pi: ExtensionAPI) {
         signal.addEventListener(
           "abort",
           () => {
-            killAgentPane(paneId, originalPane);
+            paneBackend.kill(paneId, originalPane);
             backgroundTasks.delete(id);
             clearTaskWidgetIfIdle();
             // Clean registry
@@ -1467,7 +1485,9 @@ export default function (pi: ExtensionAPI) {
             text: formatBackgroundReceipt({
               taskId: id,
               agentType: agent.name,
-              tmuxSession: sessionName,
+              backend: backendSelection.name,
+              paneId,
+              sessionName,
               artifactDir: artifactsDir,
             }),
           },
@@ -1476,7 +1496,9 @@ export default function (pi: ExtensionAPI) {
           task_id: id,
           agent_type: agent.name,
           description: descText,
-          tmux_session: sessionName,
+          backend: backendSelection.name,
+          pane_id: paneId,
+          session_name: sessionName,
           background: true,
         },
       };

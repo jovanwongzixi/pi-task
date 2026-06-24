@@ -104,7 +104,7 @@ Usage notes:
 1. Provide complete context in the prompt — the subagent starts with a fresh context
 2. Launch multiple agents concurrently when possible (use a single message with multiple tool calls)
 3. Once you delegate work, do NOT duplicate it. Continue with non-overlapping tasks, or wait for the result
-4. Background is the default. Use background:false only when you need the caller to wait inline for the tmux task result
+4. Background is the default. Use background:false only when you need the caller to wait inline for the task result
 5. Do not trust delegated output blindly. Read changed files, review the diff, verify scope, and run the relevant checks before claiming completion
 6. Clearly tell the agent whether to write code or just research, since it doesn't know the user's intent
 7. The result returned by the agent is not visible to the user. Send a concise summary back to the user
@@ -227,14 +227,18 @@ export function buildTmuxSplitWindowArgs(
 export interface BackgroundReceiptInput {
   taskId: string;
   agentType: string;
-  tmuxSession: string;
+  backend: "tmux" | "herdr" | "sdk";
+  paneId?: string;
+  sessionName: string;
   artifactDir: string;
 }
 
 export function formatBackgroundReceipt(input: BackgroundReceiptInput): string {
   return [
     `Started task ${input.taskId} with ${input.agentType}.`,
-    `Tmux session: ${input.tmuxSession}.`,
+    `Backend: ${input.backend}.`,
+    ...(input.paneId ? [`Pane: ${input.paneId}.`] : []),
+    `Session: ${input.sessionName}.`,
     `Artifact directory: ${input.artifactDir}.`,
     "A completion notification will arrive automatically; do not poll or duplicate this work.",
   ].join("\n");

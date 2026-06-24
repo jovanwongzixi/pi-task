@@ -10,8 +10,8 @@ Delegating task/subagent extension for [Pi](https://pi.dev). It adds a `task` to
 
 - Foreground tasks: parent waits and receives the subagent result directly.
 - Background tasks: parent continues, task widget shows progress, completion arrives as a follow-up.
-- Tmux backend for observable subagent panes.
-- SDK fallback when tmux is unavailable.
+- Herdr and tmux backends for observable subagent panes.
+- Pi SDK fallback for headless environments without an available pane backend.
 - Agent frontmatter support: `model`, `thinking`, `tools`, `disallowed_tools`.
 - Built-in starter agents: `scout`, `explore`, `planner`, `reviewer`, `vision`, `worker`.
 - Project/user agent overrides via `.pi/agents/*.md` or `~/.pi/agents/*.md`.
@@ -39,6 +39,7 @@ Foreground task:
   "agent_type": "explore",
   "description": "Find auth flow",
   "background": false,
+  "backend": "auto",
   "prompt": "Map the auth flow. Do not edit files. Return file:line evidence."
 }
 ```
@@ -66,25 +67,43 @@ Durable specialist conversation:
 }
 ```
 
-        `conversation_id` maps to a durable subagent run. Reused across calls
-        to keep specialist memory, e.g. a reusable research assistant.
-        Use `/task-sessions` to list known durable conversations.
+`conversation_id` maps to a durable subagent run. Reuse it across calls to keep
+specialist memory, for example as a reusable research assistant. Use
+`/task-sessions` to list known durable conversations.
 
-        Stored files (all flat at the top of `.pi/artifacts/`, no
-        per-task subdirs):
+Stored files (all flat at the top of `.pi/artifacts/`, with no per-task
+subdirectories):
 
-        ```
-        .pi/artifacts/TASKS.md              # one ### <task-id> block per task
-        .pi/artifacts/task-sessions.json    # conversation_id -> { task_id, session_file }
-        ```
+```
+.pi/artifacts/TASKS.md              # one ### <task-id> block per task
+.pi/artifacts/task-sessions.json    # conversation_id -> { task_id, session_file }
+```
 
-        The subagent's session is auto-saved by pi at
-        `~/.pi/agent/sessions/<cwd>/<session-id>.jsonl`. pi-task reads
-        the last assistant message from there to populate
-        `#### Result` in `TASKS.md`. The subagent's final message IS
-        the result; no separate result file is required.
+The subagent's session is auto-saved by Pi at
+`~/.pi/agent/sessions/<cwd>/<session-id>.jsonl`. pi-task reads the last
+assistant message from there to populate `#### Result` in `TASKS.md`. The
+subagent's final message is the result; no separate result file is required.
 
-    Note: true conversation resume requires the tmux/CLI backend so Pi can reopen the saved subagent session. SDK fallback can run one-shot tasks, but it cannot resume a prior Pi session.
+True conversation resume requires a CLI pane backend (`herdr` or `tmux`) so Pi
+can reopen the saved subagent session. The SDK backend can run one-shot tasks,
+but it cannot resume a prior Pi CLI session.
+
+## Backend selection
+
+The optional `backend` field accepts `"auto"`, `"herdr"`, `"tmux"`, or
+`"sdk"`. It defaults to `"auto"`.
+
+In auto mode, pi-task selects the first available backend in this order:
+
+1. Herdr, when running inside Herdr (`HERDR_ENV=1`) and the `herdr` CLI works.
+2. Tmux, when the `tmux` CLI works.
+3. The Pi SDK fallback.
+
+The `herdr` and `tmux` backends launch the Pi CLI in an observable pane and
+support durable conversation resume. The `sdk` backend runs without a pane and
+is intended for one-shot work in headless, CI, and RPC environments. Selecting
+an unavailable pane backend explicitly returns an error instead of silently
+using another backend.
 
 ## Agent precedence
 
@@ -125,6 +144,7 @@ npm pack --dry-run
 
 ## Notes
 
-- Tmux is recommended for interactive observability.
-- In non-tmux/headless environments, pi-task falls back to the Pi SDK backend.
+- Herdr and tmux provide interactive pane observability.
+- In environments without an available pane backend, auto mode falls back to
+  the Pi SDK backend.
 - Treat subagent results as untrusted until you read artifacts/files and verify claims.

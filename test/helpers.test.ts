@@ -921,7 +921,9 @@ import {
   const receipt = formatBackgroundReceipt({
     taskId: "task-123",
     agentType: "explore",
-    tmuxSession: "pi-task-task-123",
+    backend: "herdr",
+    paneId: "w1:p2",
+    sessionName: "pi-task-task-123",
     artifactDir: "/tmp/.pi/tasks/task-123",
   });
   assert.ok(receipt.includes("Started task task-123"), t + " includes task id");

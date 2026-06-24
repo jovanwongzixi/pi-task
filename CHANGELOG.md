@@ -4,6 +4,24 @@ All notable changes to `@heyhuynhgiabuu/pi-task` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Added a Herdr pane backend for observable foreground and background
+  subagents when Pi runs inside Herdr.
+- Added the per-task `backend` option with `auto`, `herdr`, `tmux`, and `sdk`
+  choices.
+
+### Changed
+
+- Auto backend selection now prefers Herdr when `HERDR_ENV=1` and the `herdr`
+  CLI is available, then tmux, then the Pi SDK fallback.
+- Isolated Herdr and tmux pane behavior behind separate backend classes so
+  changes to one pane implementation do not affect the other.
+- Durable conversation resume now supports either CLI pane backend (Herdr or
+  tmux); SDK tasks remain one-shot and do not resume saved Pi CLI sessions.
+
 ## [0.1.6] — 2026-06-25
 
 ### Changed

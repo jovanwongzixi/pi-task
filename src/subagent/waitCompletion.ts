@@ -1,9 +1,12 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-    import { existsSync } from "node:fs";
-    import { getLastAssistantTextFromSessionDir, hasAgentFinished } from "../session-text.js";
-    import { paneExists } from "./tmux.js";
+import {
+  getLastAssistantTextFromSessionDir,
+  hasAgentFinished,
+} from "../session-text.js";
 
-    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export type TaskCompletionStatus =
   | "running"
@@ -23,11 +26,12 @@ export interface TaskCompletionOptions {
   sessionDir: string;
   sessionName: string;
   paneId?: string;
+  paneExists?: (paneId: string) => boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
-      pollMs?: number;
-      sinceMs?: number;
-    }
+  pollMs?: number;
+  sinceMs?: number;
+}
 
 async function readResultFile(resultPath: string): Promise<string | null> {
   if (!existsSync(resultPath)) return null;
@@ -35,70 +39,66 @@ async function readResultFile(resultPath: string): Promise<string | null> {
   return text.length > 0 ? text : null;
 }
 
-        /**
-         * Get the last assistant text from the session directory, but ONLY if
-         * the agent has actually finished (agent_end emitted). Without this
-         * gate, intermediate streaming messages like "Now let me read..." are
-         * mistaken for final results and the pane is killed mid-work.
-         */
-        function readSessionText(
-          sessionDir: string,
-          sessionName: string,
-          sinceMs?: number,
-        ): string | null {
-      // Session files are written by pi directly into `sessionDir`
-      // (flat). Filter by session_info.name so a new task never
-      // completes from an older task's JSONL.
-          if (!hasAgentFinished(sessionDir, sessionName, sinceMs)) return null;
-          const text = getLastAssistantTextFromSessionDir(
-            sessionDir,
-            sessionName,
-            sinceMs,
-          ).trim();
-      return text.length > 0 ? text : null;
-    }
-    
-        export async function checkTaskCompletion(
-          options: TaskCompletionOptions,
-        ): Promise<TaskCompletionSnapshot> {
-              // When the pane has exited, give pi a brief moment to flush the
-              // session file. Without this, the read can catch a partial
-              // file (e.g. the last `agent_end` / `message_end` events not
-              // yet written) and report "failed" even though the subagent
-              // completed successfully.
-              if (options.paneId && !paneExists(options.paneId)) {
-                await sleep(500);
-              }
+/**
+ * Read final assistant text only after Pi records agent_end. This prevents
+ * streaming intermediate text from being mistaken for a completed result.
+ */
+function readSessionText(
+  sessionDir: string,
+  sessionName: string,
+  sinceMs?: number,
+): string | null {
+  if (!hasAgentFinished(sessionDir, sessionName, sinceMs)) return null;
+  const text = getLastAssistantTextFromSessionDir(
+    sessionDir,
+    sessionName,
+    sinceMs,
+  ).trim();
+  return text.length > 0 ? text : null;
+}
 
-              const result = await readResultFile(options.resultPath);
-              if (result) {
-                return { status: "completed", content: result, source: "result-file" };
-              }
+export async function checkTaskCompletion(
+  options: TaskCompletionOptions,
+): Promise<TaskCompletionSnapshot> {
+  const paneIsAlive = () =>
+    options.paneId && options.paneExists
+      ? options.paneExists(options.paneId)
+      : false;
 
-          // Check session JSONL (gated on agent_end). If the agent has
-          // finished, capture the result and kill the pane — even if the
-          // pane shell is still lingering (e.g. remain-on-exit).
-          const sessionResult = readSessionText(
-            options.sessionDir,
-            options.sessionName,
-            options.sinceMs,
-          );
-          if (sessionResult) {
-            return { status: "completed", content: sessionResult, source: "session-jsonl" };
-          }
+  // Give Pi a brief moment to flush its session after a pane exits.
+  if (options.paneId && options.paneExists && !paneIsAlive()) {
+    await sleep(500);
+  }
 
-          // No agent_end yet. If the pane is still alive, the agent is
-          // working — keep polling. Intermediate streaming text without
-          // agent_end is not a valid completion signal.
-          if (options.paneId && paneExists(options.paneId)) {
-            return { status: "running", content: "", source: "pane" };
-          }
+  const result = await readResultFile(options.resultPath);
+  if (result) {
+    return { status: "completed", content: result, source: "result-file" };
+  }
 
-          // Pane exited without agent_end or text — genuine failure.
-          return { status: "failed", content: "Subagent pane exited without producing a result." };
-        }
+  const sessionResult = readSessionText(
+    options.sessionDir,
+    options.sessionName,
+    options.sinceMs,
+  );
+  if (sessionResult) {
+    return {
+      status: "completed",
+      content: sessionResult,
+      source: "session-jsonl",
+    };
+  }
 
-    export async function waitForTaskCompletion(
+  if (paneIsAlive()) {
+    return { status: "running", content: "", source: "pane" };
+  }
+
+  return {
+    status: "failed",
+    content: "Subagent pane exited without producing a result.",
+  };
+}
+
+export async function waitForTaskCompletion(
   options: TaskCompletionOptions,
 ): Promise<TaskCompletionSnapshot> {
   const timeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
@@ -125,6 +125,6 @@ async function readResultFile(resultPath: string): Promise<string | null> {
       };
     }
 
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await sleep(pollMs);
   }
 }
