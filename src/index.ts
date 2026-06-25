@@ -54,6 +54,7 @@ import {
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import {
   type SubagentBackendName,
+  type SubagentOutcome,
   type SubagentPaneBackend,
   selectSubagentBackend,
 } from "./subagent/backend.js";
@@ -106,6 +107,8 @@ interface BackgroundTask {
   recentCalls: ToolCallRecord[];
   /** Consecutive completion-poll failures; reset to 0 on a successful poll. */
   pollErrors?: number;
+  /** Guards backend lifecycle hooks against races between polling and aborts. */
+  finalized?: boolean;
 }
 
 /** Serializable subset for active task registry persistence. */
@@ -136,7 +139,7 @@ interface TaskDetails {
   agent_type: string;
   description: string;
   conversation_id?: string;
-  phase: "done" | "timeout" | "aborted" | "failed";
+  phase: "done" | "timeout" | "cancelled" | "aborted" | "failed";
   // Completed phase
   status?: string;
   summary?: string;
@@ -284,8 +287,32 @@ function registryPaneIsAlive(entry: RegistryEntry): boolean {
   return getPaneBackend(entry.backend)?.exists(entry.paneId) ?? false;
 }
 
-function killTaskPane(task: BackgroundTask): void {
-  getPaneBackend(task.backend)?.kill(task.paneId, task.originalPane);
+type TaskTerminalPhase = "done" | "timeout" | "cancelled" | "failed";
+
+function outcomeForPhase(phase: TaskTerminalPhase): SubagentOutcome {
+  switch (phase) {
+    case "done":
+      return "completed";
+    case "timeout":
+      return "timeout";
+    case "cancelled":
+      return "cancelled";
+    case "failed":
+      return "failed";
+  }
+}
+
+function finalizeTaskPane(
+  task: BackgroundTask,
+  outcome: SubagentOutcome,
+): void {
+  if (task.backend === "sdk" || task.finalized) return;
+  task.finalized = true;
+  getPaneBackend(task.backend)?.finalize(
+    task.paneId,
+    task.originalPane,
+    outcome,
+  );
 }
 
 // ─── Process a completed task (sendMessage + registry cleanup) ──────────────
@@ -295,10 +322,11 @@ function completeTask(
   id: string,
   task: BackgroundTask,
   content: string,
-  phase: "done" | "timeout" | "failed",
+  phase: TaskTerminalPhase,
   piDir: string,
+  outcome: SubagentOutcome = outcomeForPhase(phase),
 ): void {
-  killTaskPane(task);
+  finalizeTaskPane(task, outcome);
 
   const parsed = parseResultXml(content);
   const durationMs = Date.now() - task.startedAt;
@@ -375,6 +403,7 @@ export default function (pi: ExtensionAPI) {
   const { piDir } = discoverAgents(process.cwd());
   const registry = readRegistry(piDir);
   const staleIds: string[] = [];
+  const restoredHerdrPanes: { paneId: string; startedAt: number }[] = [];
   for (const entry of registry) {
     // Only restore if artifact dir still exists
     if (!existsSync(entry.dir)) {
@@ -404,6 +433,15 @@ export default function (pi: ExtensionAPI) {
     };
 
     backgroundTasks.set(entry.id, bgtask);
+    if (bgtask.backend === "herdr" && bgtask.paneId) {
+      restoredHerdrPanes.push({
+        paneId: bgtask.paneId,
+        startedAt: bgtask.startedAt,
+      });
+    }
+  }
+  if (restoredHerdrPanes.length > 0) {
+    getPaneBackend("herdr")?.adoptRestoredPanes?.(restoredHerdrPanes);
   }
   if (staleIds.length) {
     writeRegistry(
@@ -529,7 +567,6 @@ export default function (pi: ExtensionAPI) {
 
         // ── Check timeout ────────────────────────────────────────────
         if (now - task.startedAt > TASK_TIMEOUT_MS) {
-          killTaskPane(task);
           backgroundTasks.delete(id);
           clearTaskWidgetIfIdle();
           completeTask(
@@ -565,7 +602,6 @@ export default function (pi: ExtensionAPI) {
         } catch (err) {
           task.pollErrors = (task.pollErrors ?? 0) + 1;
           if (task.pollErrors >= MAX_POLL_ERRORS) {
-            killTaskPane(task);
             backgroundTasks.delete(id);
             clearTaskWidgetIfIdle();
             const message = err instanceof Error ? err.message : String(err);
@@ -576,6 +612,7 @@ export default function (pi: ExtensionAPI) {
               `Task ${id} polling failed ${task.pollErrors}x; last error: ${message}`,
               "failed",
               piDir,
+              "tracking-error",
             );
           }
           // Otherwise leave the task tracked and retry next tick.
@@ -1271,6 +1308,7 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           command: shellCommand,
           description: descText,
+          agentType: agent.name,
         });
         paneId = splitResult.paneId;
         originalPane = splitResult.originalPane;
@@ -1279,6 +1317,7 @@ export default function (pi: ExtensionAPI) {
           foregroundTask.originalPane = originalPane;
         }
       } catch (error) {
+        paneBackend.rollbackSpawn();
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
         const message = error instanceof Error ? error.message : String(error);
@@ -1325,12 +1364,22 @@ export default function (pi: ExtensionAPI) {
           sinceMs: startedAt,
         });
         const content = completion.content;
-        const phase =
+        const phase: TaskTerminalPhase =
           completion.status === "completed"
             ? "done"
-            : completion.status === "cancelled"
-              ? "cancelled"
-              : "failed";
+            : completion.status === "timeout"
+              ? "timeout"
+              : completion.status === "cancelled"
+                ? "cancelled"
+                : "failed";
+        const outcome: SubagentOutcome =
+          completion.status === "completed"
+            ? "completed"
+            : completion.status === "timeout"
+              ? "timeout"
+              : completion.status === "cancelled"
+                ? "cancelled"
+                : "failed";
         const completedSessionRef = findJsonlSessionByName(
           piDir,
           sessionName,
@@ -1352,7 +1401,11 @@ export default function (pi: ExtensionAPI) {
           completedAt: Date.now(),
           background: false,
         });
-        paneBackend.kill(paneId, originalPane);
+        if (foregroundTask) {
+          finalizeTaskPane(foregroundTask, outcome);
+        } else {
+          paneBackend.finalize(paneId, originalPane, outcome);
+        }
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
 
@@ -1457,12 +1510,18 @@ export default function (pi: ExtensionAPI) {
         signal.addEventListener(
           "abort",
           () => {
-            paneBackend.kill(paneId, originalPane);
-            backgroundTasks.delete(id);
+            if (!backgroundTasks.delete(id)) return;
+            finalizeTaskPane(bgtask, "cancelled");
             clearTaskWidgetIfIdle();
             // Clean registry
             const remaining = readRegistry(piDir).filter((e) => e.id !== id);
             writeRegistry(piDir, remaining);
+            upsertTaskSessionHistory(piDir, {
+              ...entry,
+              status: "cancelled",
+              completedAt: Date.now(),
+              background: true,
+            });
             if (backgroundTasks.size === 0) {
               stopWidget();
               if (widgetCtx) {
@@ -1543,6 +1602,7 @@ export default function (pi: ExtensionAPI) {
 
       if (
         d.phase === "timeout" ||
+        d.phase === "cancelled" ||
         d.phase === "aborted" ||
         d.phase === "failed"
       ) {
@@ -1556,6 +1616,7 @@ export default function (pi: ExtensionAPI) {
         d.status === "blocked" ||
         d.status === "unknown" ||
         d.status === "timeout" ||
+        d.status === "cancelled" ||
         d.status === "failed";
 
       const durationMs = d.duration_ms || 0;
