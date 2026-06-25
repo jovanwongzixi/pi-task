@@ -13,6 +13,7 @@ import {
   parseHerdrTabs,
   parseSplitHerdrPaneId,
   selectLargestHerdrLayoutPane,
+  sortHerdrLayoutPanesForAssignment,
 } from "../src/subagent/herdr.js";
 import { TmuxBackend } from "../src/subagent/tmux.js";
 
@@ -35,6 +36,15 @@ type LifecyclePaneBackend = {
 type HerdrBackendContract = HerdrBackend & LifecyclePaneBackend;
 type TmuxBackendContract = TmuxBackend & LifecyclePaneBackend;
 
+interface SimulatedHerdrPane {
+  paneId: string;
+  tabId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 function hasCall(calls: string[][], expected: string[]): boolean {
   return calls.some((call) => arrayEqual(call, expected));
 }
@@ -54,6 +64,153 @@ function tmuxBackend(
   command: (args: string[], input?: string) => string,
 ): TmuxBackendContract {
   return new TmuxBackend(command) as TmuxBackendContract;
+}
+
+function layoutResponse(panes: readonly SimulatedHerdrPane[]): string {
+  return JSON.stringify({
+    result: {
+      layout: {
+        panes: panes.map((pane) => ({
+          pane_id: pane.paneId,
+          x: pane.x,
+          y: pane.y,
+          width: pane.width,
+          height: pane.height,
+        })),
+      },
+    },
+  });
+}
+
+function splitSimulatedPane(
+  panes: SimulatedHerdrPane[],
+  paneId: string,
+  newPaneId: string,
+  direction: "right" | "down",
+): void {
+  const pane = panes.find((candidate) => candidate.paneId === paneId);
+  if (!pane) throw new Error(`Cannot split missing pane ${paneId}`);
+
+  if (direction === "right") {
+    const leftWidth = Math.floor(pane.width / 2);
+    const rightWidth = pane.width - leftWidth;
+    const rightX = pane.x + leftWidth;
+    pane.width = leftWidth;
+    panes.push({
+      paneId: newPaneId,
+      tabId: pane.tabId,
+      x: rightX,
+      y: pane.y,
+      width: rightWidth,
+      height: pane.height,
+    });
+    return;
+  }
+
+  const topHeight = Math.floor(pane.height / 2);
+  const bottomHeight = pane.height - topHeight;
+  const bottomY = pane.y + topHeight;
+  pane.height = topHeight;
+  panes.push({
+    paneId: newPaneId,
+    tabId: pane.tabId,
+    x: pane.x,
+    y: bottomY,
+    width: pane.width,
+    height: bottomHeight,
+  });
+}
+
+function simulatedBatchHerdr(options: {
+  calls: string[][];
+  initialWidth?: number;
+  initialHeight?: number;
+  onCall?: (args: string[], panes: SimulatedHerdrPane[]) => string | undefined;
+}): HerdrBackendContract {
+  const panes: SimulatedHerdrPane[] = [];
+  let createCount = 0;
+  let splitCount = 0;
+  return herdrBackend((args) => {
+    options.calls.push(args);
+    const overridden = options.onCall?.(args, panes);
+    if (overridden !== undefined) return overridden;
+
+    if (arrayEqual(args, ["pane", "list"])) {
+      return JSON.stringify({
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+            ...panes.map((pane) => ({
+              pane_id: pane.paneId,
+              tab_id: pane.tabId,
+              workspace_id: "workspace-1",
+              focused: false,
+            })),
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({
+        result: {
+          tabs: [...new Set(panes.map((pane) => pane.tabId))].map(
+            (tabId, index) => ({
+              tab_id: tabId,
+              workspace_id: "workspace-1",
+              label: `Agents ${index + 1}`,
+              pane_count: panes.filter((pane) => pane.tabId === tabId).length,
+            }),
+          ),
+        },
+      });
+    }
+    if (args[0] === "tab" && args[1] === "create") {
+      createCount++;
+      const tabId = `tab-agents-${createCount}`;
+      const rootPaneId = `agent-root-${createCount}`;
+      panes.push({
+        paneId: rootPaneId,
+        tabId,
+        x: 0,
+        y: 0,
+        width: options.initialWidth ?? 160,
+        height: options.initialHeight ?? 80,
+      });
+      return JSON.stringify({
+        result: {
+          tab: { tab_id: tabId, workspace_id: "workspace-1" },
+          root_pane: { pane_id: rootPaneId, tab_id: tabId },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "layout") {
+      return layoutResponse(panes);
+    }
+    if (args[0] === "pane" && args[1] === "split") {
+      splitCount++;
+      const newPaneId = `agent-child-${splitCount + 1}`;
+      splitSimulatedPane(
+        panes,
+        args[2] as string,
+        newPaneId,
+        args[4] as "right" | "down",
+      );
+      return JSON.stringify({ result: { pane: { pane_id: newPaneId } } });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (args[0] === "pane" && args[1] === "run") return "";
+    if (args[0] === "pane" && args[1] === "close") {
+      const index = panes.findIndex((pane) => pane.paneId === args[2]);
+      if (index >= 0) panes.splice(index, 1);
+      return "";
+    }
+    throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+  });
 }
 
 function fakeBackend(
@@ -261,9 +418,27 @@ test("Herdr JSON parsers extract tab create, tab list, and pane layout responses
       return panes;
     })(),
     [
-      { paneId: "pane-small", width: 80, height: 24, area: 1920 },
-      { paneId: "pane-large", width: 120, height: 48, area: 5760 },
+      { paneId: "pane-small", x: 0, y: 0, width: 80, height: 24, area: 1920 },
+      {
+        paneId: "pane-large",
+        x: 80,
+        y: 0,
+        width: 120,
+        height: 48,
+        area: 5760,
+      },
     ],
+  );
+});
+
+test("Herdr layout assignment order is top-to-bottom then left-to-right", () => {
+  assert.deepEqual(
+    sortHerdrLayoutPanesForAssignment([
+      { paneId: "bottom-left", x: 0, y: 40, width: 40, height: 20, area: 800 },
+      { paneId: "top-right", x: 80, y: 0, width: 40, height: 20, area: 800 },
+      { paneId: "top-left", x: 0, y: 0, width: 40, height: 20, area: 800 },
+    ]).map((pane) => pane.paneId),
+    ["top-left", "top-right", "bottom-left"],
   );
 });
 

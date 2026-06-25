@@ -15,9 +15,40 @@ export interface SpawnSubagentOptions {
   agentType?: string;
 }
 
+export interface SpawnSubagentBatchItemOptions {
+  command: string;
+  description?: string;
+  agentType?: string;
+}
+
+export interface SpawnSubagentBatchOptions {
+  cwd: string;
+  tasks: SpawnSubagentBatchItemOptions[];
+  tabLabel?: string;
+  tab_label?: string;
+}
+
 export interface SpawnedSubagentPane {
   paneId: string;
   originalPane: string | null;
+}
+
+export type SpawnedSubagentBatchItem =
+  | {
+      paneId: string;
+      originalPane: string | null;
+      error?: undefined;
+    }
+  | {
+      paneId?: undefined;
+      originalPane: string | null;
+      error: Error;
+    };
+
+export interface SpawnedSubagentBatch {
+  tabId: string;
+  originalPane: string | null;
+  items: SpawnedSubagentBatchItem[];
 }
 
 /** Terminal-pane operations shared by the tmux and herdr implementations. */
@@ -25,6 +56,7 @@ export interface SubagentPaneBackend {
   readonly name: PaneBackendName;
   available(): boolean;
   spawn(options: SpawnSubagentOptions): SpawnedSubagentPane;
+  spawnBatch?(options: SpawnSubagentBatchOptions): SpawnedSubagentBatch;
   exists(paneId: string): boolean;
   finalize(
     paneId: string | undefined,

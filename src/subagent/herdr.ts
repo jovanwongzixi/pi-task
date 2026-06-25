@@ -1,5 +1,8 @@
 import { execFileSync } from "node:child_process";
 import type {
+  SpawnSubagentBatchOptions,
+  SpawnedSubagentBatch,
+  SpawnedSubagentBatchItem,
   SpawnSubagentOptions,
   SpawnedSubagentPane,
   SubagentOutcome,
@@ -30,6 +33,8 @@ export interface HerdrCreatedTab {
 
 export interface HerdrLayoutPane {
   paneId: string;
+  x: number;
+  y: number;
   width: number;
   height: number;
   area: number;
@@ -80,6 +85,23 @@ function getNumber(
     if (Number.isFinite(number) && number > 0) return number;
   }
   return null;
+}
+
+function getCoordinate(
+  value: Record<string, unknown>,
+  names: readonly string[],
+): number {
+  for (const name of names) {
+    const raw = value[name];
+    const number =
+      typeof raw === "number"
+        ? raw
+        : typeof raw === "string"
+          ? Number(raw)
+          : Number.NaN;
+    if (Number.isFinite(number) && number >= 0) return number;
+  }
+  return 0;
 }
 
 function getDimension(
@@ -175,7 +197,14 @@ export function parseHerdrLayoutPanes(raw: string): HerdrLayoutPane[] {
       ]);
       const height = getDimension(node, ["height", "h", "rows"]);
       if (paneId && width !== null && height !== null) {
-        panes.push({ paneId, width, height, area: width * height });
+        panes.push({
+          paneId,
+          x: getCoordinate(node, ["x", "left", "col", "column"]),
+          y: getCoordinate(node, ["y", "top", "row"]),
+          width,
+          height,
+          area: width * height,
+        });
       }
     }
 
@@ -209,6 +238,17 @@ export function selectLargestHerdrLayoutPane(
   return largest;
 }
 
+export function sortHerdrLayoutPanesForAssignment(
+  panes: readonly HerdrLayoutPane[],
+): HerdrLayoutPane[] {
+  return [...panes].sort(
+    (left, right) =>
+      left.y - right.y ||
+      left.x - right.x ||
+      left.paneId.localeCompare(right.paneId),
+  );
+}
+
 export function chooseHerdrSplitDirection(
   width: number,
   height: number,
@@ -230,8 +270,14 @@ function boundedLabel(options: SpawnSubagentOptions): string | null {
     .filter((part): part is string => Boolean(part));
   if (parts.length === 0) return null;
 
-  const label = parts.join(": ");
-  return label.length <= 64 ? label : `${label.slice(0, 61)}...`;
+  return boundHerdrLabel(parts.join(": "));
+}
+
+function boundHerdrLabel(label: string): string {
+  const normalized = label.replace(/\s+/g, " ").trim();
+  return normalized.length <= 64
+    ? normalized
+    : `${normalized.slice(0, 61)}...`;
 }
 
 function nextAgentsTabLabel(tabs: readonly HerdrTab[]): string {
@@ -246,10 +292,15 @@ function nextAgentsTabLabel(tabs: readonly HerdrTab[]): string {
   return `Agents ${max + 1}`;
 }
 
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 /** Herdr-specific pane lifecycle. No tmux behavior belongs in this class. */
 export class HerdrBackend implements SubagentPaneBackend {
   readonly name = "herdr" as const;
-  private wave: HerdrWave | null = null;
+  private readonly waves = new Map<string, HerdrWave>();
+  private currentWaveTabId: string | null = null;
 
   constructor(private readonly command: HerdrCommand = defaultHerdrCommand) {}
 
@@ -284,7 +335,13 @@ export class HerdrBackend implements SubagentPaneBackend {
     }
 
     const wave =
-      this.revalidateWave(panes) ?? this.createWave(workspaceId, options);
+      this.revalidateCurrentWave(panes) ??
+      this.createWave({
+        workspaceId,
+        cwd: options.cwd,
+        label: nextAgentsTabLabel(this.listTabs(workspaceId)),
+        makeCurrent: true,
+      });
     const paneId =
       wave.activePaneIds.size === 0
         ? this.getRootPaneForNewWave(wave)
@@ -296,10 +353,127 @@ export class HerdrBackend implements SubagentPaneBackend {
       wave.activePaneIds.add(paneId);
     } catch (error) {
       this.rollbackSpawn(paneId);
+      this.removeEmptyWave(wave);
       throw error;
     }
 
     return { paneId, originalPane };
+  }
+
+  spawnBatch(options: SpawnSubagentBatchOptions): SpawnedSubagentBatch {
+    if (options.tasks.length === 0) {
+      throw new Error("Herdr batch spawn requires at least one task.");
+    }
+
+    const panes = this.listPanes();
+    const focusedPane = panes.find((pane) => pane.focused);
+    const originalPane = focusedPane?.pane_id ?? null;
+    if (!originalPane) {
+      throw new Error("Could not determine the focused herdr pane.");
+    }
+    const workspaceId = focusedPane?.workspace_id;
+    if (!workspaceId) {
+      throw new Error("Focused herdr pane did not include workspace_id.");
+    }
+
+    const tabLabel = boundHerdrLabel(
+      options.tabLabel ??
+        options.tab_label ??
+        nextAgentsTabLabel(this.listTabs(workspaceId)),
+    );
+    const wave = this.createWave({
+      workspaceId,
+      cwd: options.cwd,
+      label: tabLabel,
+      makeCurrent: false,
+    });
+
+    const createdPaneIds = new Set<string>([this.getRootPaneForNewWave(wave)]);
+    const itemErrors = new Map<number, Error>();
+
+    for (let index = 1; index < options.tasks.length; index++) {
+      try {
+        createdPaneIds.add(this.splitLargestPaneInTab(wave, options.cwd));
+      } catch (error) {
+        itemErrors.set(index, toError(error));
+      }
+    }
+
+    const runnableIndexes = options.tasks
+      .map((_, index) => index)
+      .filter((index) => !itemErrors.has(index));
+    const assignments = new Map<number, string>();
+
+    try {
+      const sortedPanes = sortHerdrLayoutPanesForAssignment(
+        parseHerdrLayoutPanes(
+          this.command(["pane", "layout", "--pane", [...createdPaneIds][0]]),
+        ),
+      ).filter((pane) => createdPaneIds.has(pane.paneId));
+
+      for (
+        let index = 0;
+        index < runnableIndexes.length && index < sortedPanes.length;
+        index++
+      ) {
+        assignments.set(
+          runnableIndexes[index] as number,
+          sortedPanes[index]!.paneId,
+        );
+      }
+      for (
+        let index = sortedPanes.length;
+        index < runnableIndexes.length;
+        index++
+      ) {
+        itemErrors.set(
+          runnableIndexes[index] as number,
+          new Error("Herdr batch did not create enough panes for this task."),
+        );
+      }
+    } catch (error) {
+      for (const index of runnableIndexes) {
+        itemErrors.set(index, toError(error));
+      }
+    }
+
+    const usedPaneIds = new Set(assignments.values());
+    const results: SpawnedSubagentBatchItem[] = options.tasks.map(
+      (_, index) => ({
+        originalPane,
+        error:
+          itemErrors.get(index) ??
+          new Error("Herdr batch did not assign a pane for this task."),
+      }),
+    );
+
+    for (const [index, paneId] of assignments) {
+      const task = options.tasks[index]!;
+      try {
+        this.renamePaneForInspection(paneId, {
+          cwd: options.cwd,
+          command: task.command,
+          description: task.description,
+          agentType: task.agentType,
+        });
+        this.command(["pane", "run", paneId, task.command]);
+        wave.activePaneIds.add(paneId);
+        results[index] = { paneId, originalPane };
+      } catch (error) {
+        itemErrors.set(index, toError(error));
+        results[index] = { originalPane, error: toError(error) };
+        this.closePaneBestEffort(paneId);
+      }
+    }
+
+    for (const paneId of createdPaneIds) {
+      if (!usedPaneIds.has(paneId) || !wave.activePaneIds.has(paneId)) {
+        this.closePaneBestEffort(paneId);
+      }
+    }
+    this.removeEmptyWave(wave);
+
+    return { tabId: wave.tabId, originalPane, items: results };
   }
 
   finalize(
@@ -316,24 +490,14 @@ export class HerdrBackend implements SubagentPaneBackend {
     }
 
     if (paneId) {
-      this.wave?.activePaneIds.delete(paneId);
-    }
-    if (this.wave && this.wave.activePaneIds.size === 0) {
-      this.wave = null;
+      this.removePaneFromWaves(paneId);
     }
   }
 
   rollbackSpawn(paneId?: string): void {
     if (!paneId) return;
-    this.wave?.activePaneIds.delete(paneId);
-    if (this.wave && this.wave.activePaneIds.size === 0) {
-      this.wave = null;
-    }
-    try {
-      this.command(["pane", "close", paneId]);
-    } catch {
-      // Pane already exited or its live ID is no longer valid.
-    }
+    this.removePaneFromWaves(paneId);
+    this.closePaneBestEffort(paneId);
   }
 
   kill(paneId?: string): void {
@@ -347,7 +511,8 @@ export class HerdrBackend implements SubagentPaneBackend {
 
   adoptRestoredPanes(entries: { paneId: string; startedAt: number }[]): void {
     if (entries.length === 0) {
-      this.wave = null;
+      this.waves.clear();
+      this.currentWaveTabId = null;
       return;
     }
 
@@ -355,7 +520,8 @@ export class HerdrBackend implements SubagentPaneBackend {
     try {
       livePanes = this.listPanes();
     } catch {
-      this.wave = null;
+      this.waves.clear();
+      this.currentWaveTabId = null;
       return;
     }
 
@@ -391,7 +557,16 @@ export class HerdrBackend implements SubagentPaneBackend {
       groups.set(tabId, group);
     }
 
-    const adopted = [...groups.values()].reduce<
+    this.waves.clear();
+    for (const group of groups.values()) {
+      this.waves.set(group.tabId, {
+        workspaceId: group.workspaceId,
+        tabId: group.tabId,
+        activePaneIds: group.paneIds,
+      });
+    }
+
+    const current = [...groups.values()].reduce<
       | {
           workspaceId: string;
           tabId: string;
@@ -405,13 +580,7 @@ export class HerdrBackend implements SubagentPaneBackend {
       undefined,
     );
 
-    this.wave = adopted
-      ? {
-          workspaceId: adopted.workspaceId,
-          tabId: adopted.tabId,
-          activePaneIds: adopted.paneIds,
-        }
-      : null;
+    this.currentWaveTabId = current?.tabId ?? null;
   }
 
   private listPanes(): HerdrPane[] {
@@ -424,31 +593,33 @@ export class HerdrBackend implements SubagentPaneBackend {
     );
   }
 
-  private createWave(
-    workspaceId: string,
-    options: SpawnSubagentOptions,
-  ): HerdrWave {
-    const label = nextAgentsTabLabel(this.listTabs(workspaceId));
+  private createWave(options: {
+    workspaceId: string;
+    cwd: string;
+    label: string;
+    makeCurrent: boolean;
+  }): HerdrWave {
     const created = parseCreatedHerdrTab(
       this.command([
         "tab",
         "create",
         "--workspace",
-        workspaceId,
+        options.workspaceId,
         "--cwd",
         options.cwd,
         "--label",
-        label,
+        boundHerdrLabel(options.label),
         "--no-focus",
       ]),
     );
     const wave = {
-      workspaceId,
+      workspaceId: options.workspaceId,
       tabId: created.tabId,
       activePaneIds: new Set<string>(),
       rootPaneId: created.rootPaneId,
     };
-    this.wave = wave;
+    this.waves.set(wave.tabId, wave);
+    if (options.makeCurrent) this.currentWaveTabId = wave.tabId;
     return wave;
   }
 
@@ -476,9 +647,25 @@ export class HerdrBackend implements SubagentPaneBackend {
       throw new Error("Could not find an active pane in the Herdr task tab.");
     }
 
+    return this.splitLargestPaneInTab(wave, options.cwd, anchorPane.pane_id);
+  }
+
+  private splitLargestPaneInTab(
+    wave: HerdrWave,
+    cwd: string,
+    anchorPaneId?: string,
+  ): string {
+    const layoutAnchorPaneId =
+      anchorPaneId ??
+      wave.rootPaneId ??
+      this.listPanes().find((pane) => pane.tab_id === wave.tabId)?.pane_id;
+    if (!layoutAnchorPaneId) {
+      throw new Error("Could not find a Herdr pane for task tab layout.");
+    }
+
     const largestPane = selectLargestHerdrLayoutPane(
       parseHerdrLayoutPanes(
-        this.command(["pane", "layout", "--pane", anchorPane.pane_id]),
+        this.command(["pane", "layout", "--pane", layoutAnchorPaneId]),
       ),
     );
     const direction = chooseHerdrSplitDirection(
@@ -495,23 +682,26 @@ export class HerdrBackend implements SubagentPaneBackend {
         "--ratio",
         "0.5",
         "--cwd",
-        options.cwd,
+        cwd,
         "--no-focus",
       ]),
     );
   }
 
-  private revalidateWave(panes: readonly HerdrPane[]): HerdrWave | null {
-    if (!this.wave) return null;
+  private revalidateCurrentWave(panes: readonly HerdrPane[]): HerdrWave | null {
+    const wave = this.currentWaveTabId
+      ? this.waves.get(this.currentWaveTabId)
+      : undefined;
+    if (!wave) return null;
 
     try {
-      const tabs = this.listTabs(this.wave.workspaceId);
-      if (!tabs.some((tab) => tab.tab_id === this.wave?.tabId)) {
-        this.wave = null;
+      const tabs = this.listTabs(wave.workspaceId);
+      if (!tabs.some((tab) => tab.tab_id === wave.tabId)) {
+        this.removeWave(wave.tabId);
         return null;
       }
     } catch {
-      this.wave = null;
+      this.removeWave(wave.tabId);
       return null;
     }
 
@@ -519,18 +709,18 @@ export class HerdrBackend implements SubagentPaneBackend {
       panes
         .filter(
           (pane) =>
-            pane.tab_id === this.wave?.tabId &&
+            pane.tab_id === wave.tabId &&
             pane.pane_id &&
-            this.wave?.activePaneIds.has(pane.pane_id),
+            wave.activePaneIds.has(pane.pane_id),
         )
         .map((pane) => pane.pane_id as string),
     );
-    this.wave.activePaneIds = liveActivePaneIds;
-    if (this.wave.activePaneIds.size === 0) {
-      this.wave = null;
+    wave.activePaneIds = liveActivePaneIds;
+    if (wave.activePaneIds.size === 0 && !wave.rootPaneId) {
+      this.removeWave(wave.tabId);
       return null;
     }
-    return this.wave;
+    return wave;
   }
 
   private renamePaneForInspection(
@@ -551,6 +741,33 @@ export class HerdrBackend implements SubagentPaneBackend {
       return this.listPanes().some((pane) => pane.pane_id === paneId);
     } catch {
       return false;
+    }
+  }
+
+  private removePaneFromWaves(paneId: string): void {
+    for (const wave of this.waves.values()) {
+      if (!wave.activePaneIds.delete(paneId)) continue;
+      this.removeEmptyWave(wave);
+      return;
+    }
+  }
+
+  private removeEmptyWave(wave: HerdrWave): void {
+    if (wave.activePaneIds.size === 0 && !wave.rootPaneId) {
+      this.removeWave(wave.tabId);
+    }
+  }
+
+  private removeWave(tabId: string): void {
+    this.waves.delete(tabId);
+    if (this.currentWaveTabId === tabId) this.currentWaveTabId = null;
+  }
+
+  private closePaneBestEffort(paneId: string): void {
+    try {
+      this.command(["pane", "close", paneId]);
+    } catch {
+      // Pane already exited or its live ID is no longer valid.
     }
   }
 }
