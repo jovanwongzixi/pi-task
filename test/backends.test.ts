@@ -189,7 +189,10 @@ function simulatedBatchHerdr(options: {
       });
     }
     if (args[0] === "pane" && args[1] === "layout") {
-      return layoutResponse(panes);
+      const anchor = panes.find((pane) => pane.paneId === args[3]);
+      return layoutResponse(
+        anchor ? panes.filter((pane) => pane.tabId === anchor.tabId) : panes,
+      );
     }
     if (args[0] === "pane" && args[1] === "split") {
       splitCount++;
@@ -889,6 +892,317 @@ test("Herdr pane label failures do not fail task launch", () => {
   );
   assert.equal(
     hasCall(calls, ["pane", "run", "agent-root-1", "pi --name worker"]),
+    true,
+  );
+});
+
+test("Herdr batch spawn uses a custom tab_label", () => {
+  const calls: string[][] = [];
+  const backend = simulatedBatchHerdr({ calls });
+
+  const result = backend.spawnBatch?.({
+    cwd: "/repo",
+    tab_label: "Investigation",
+    tasks: [{ command: "pi --name first" }],
+  });
+
+  assert.equal(result?.tabId, "tab-agents-1");
+  assert.equal(
+    hasCall(calls, [
+      "tab",
+      "create",
+      "--workspace",
+      "workspace-1",
+      "--cwd",
+      "/repo",
+      "--label",
+      "Investigation",
+      "--no-focus",
+    ]),
+    true,
+  );
+});
+
+test("Herdr batch pre-creates all panes before any pane run", () => {
+  const calls: string[][] = [];
+  const backend = simulatedBatchHerdr({ calls });
+
+  backend.spawnBatch?.({
+    cwd: "/repo",
+    tasks: [
+      { command: "pi --name one" },
+      { command: "pi --name two" },
+      { command: "pi --name three" },
+      { command: "pi --name four" },
+    ],
+  });
+
+  const splitIndexes = calls
+    .map((call, index) => ({ call, index }))
+    .filter(({ call }) => call[0] === "pane" && call[1] === "split")
+    .map(({ index }) => index);
+  const firstRunIndex = calls.findIndex(
+    (call) => call[0] === "pane" && call[1] === "run",
+  );
+
+  assert.equal(splitIndexes.length, 3);
+  assert.equal(splitIndexes.every((index) => index < firstRunIndex), true);
+});
+
+test("Herdr batch uses representative balanced split counts", () => {
+  for (const count of [1, 2, 3, 4, 5, 8]) {
+    const calls: string[][] = [];
+    const backend = simulatedBatchHerdr({ calls });
+
+    const result = backend.spawnBatch?.({
+      cwd: "/repo",
+      tasks: Array.from({ length: count }, (_, index) => ({
+        command: `pi --name task-${index + 1}`,
+      })),
+    });
+
+    assert.equal(
+      calls.filter((call) => call[0] === "tab" && call[1] === "create").length,
+      1,
+    );
+    assert.equal(
+      calls.filter((call) => call[0] === "pane" && call[1] === "split").length,
+      count - 1,
+    );
+    assert.equal(
+      calls
+        .filter((call) => call[0] === "pane" && call[1] === "split")
+        .every((call) => call.includes("--ratio") && call.includes("0.5")),
+      true,
+    );
+    assert.deepEqual(
+      result?.items.map((item) => ("paneId" in item ? Boolean(item.paneId) : false)),
+      Array.from({ length: count }, () => true),
+    );
+  }
+});
+
+test("Herdr batch assigns labels and runs by visual pane order", () => {
+  const calls: string[][] = [];
+  const backend = simulatedBatchHerdr({ calls });
+
+  const result = backend.spawnBatch?.({
+    cwd: "/repo",
+    tabLabel: "Agents Batch",
+    tasks: [
+      {
+        agentType: "explore",
+        description: "top left",
+        command: "pi --name one",
+      },
+      {
+        agentType: "explore",
+        description: "top right",
+        command: "pi --name two",
+      },
+      {
+        agentType: "review",
+        description: "bottom left",
+        command: "pi --name three",
+      },
+      {
+        agentType: "review",
+        description: "bottom right",
+        command: "pi --name four",
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    result?.items.map((item) => ("paneId" in item ? item.paneId : "error")),
+    ["agent-root-1", "agent-child-2", "agent-child-3", "agent-child-4"],
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call[0] === "pane" && call[1] === "rename")
+      .map((call) => call.slice(2)),
+    [
+      ["agent-root-1", "explore: top left"],
+      ["agent-child-2", "explore: top right"],
+      ["agent-child-3", "review: bottom left"],
+      ["agent-child-4", "review: bottom right"],
+    ],
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call[0] === "pane" && call[1] === "run")
+      .map((call) => call.slice(2)),
+    [
+      ["agent-root-1", "pi --name one"],
+      ["agent-child-2", "pi --name two"],
+      ["agent-child-3", "pi --name three"],
+      ["agent-child-4", "pi --name four"],
+    ],
+  );
+});
+
+test("Herdr batch failures close failed panes, keep launched panes, and continue", () => {
+  const calls: string[][] = [];
+  const backend = simulatedBatchHerdr({
+    calls,
+    onCall(args) {
+      if (arrayEqual(args, ["pane", "run", "agent-child-2", "pi --name two"])) {
+        throw new Error("run failed");
+      }
+      return undefined;
+    },
+  });
+
+  const result = backend.spawnBatch?.({
+    cwd: "/repo",
+    tasks: [
+      { command: "pi --name one" },
+      { command: "pi --name two" },
+      { command: "pi --name three" },
+    ],
+  });
+
+  assert.equal(result?.items[0]?.paneId, "agent-root-1");
+  assert.equal(result?.items[1]?.error?.message, "run failed");
+  assert.equal(result?.items[2]?.paneId, "agent-child-3");
+  assert.equal(hasCall(calls, ["pane", "close", "agent-child-2"]), true);
+  assert.equal(hasCall(calls, ["pane", "close", "agent-root-1"]), false);
+  assert.equal(hasCall(calls, ["pane", "close", "agent-child-3"]), false);
+  assert.equal(
+    hasCall(calls, ["pane", "run", "agent-child-3", "pi --name three"]),
+    true,
+  );
+});
+
+test("Herdr tracks multiple waves for finalize and keeps current wave for normal spawn", () => {
+  const calls: string[][] = [];
+  const backend = simulatedBatchHerdr({ calls });
+
+  const normal = backend.spawn({ cwd: "/repo", command: "pi --name normal" });
+  const batch = backend.spawnBatch?.({
+    cwd: "/repo",
+    tasks: [
+      { command: "pi --name batch-one" },
+      { command: "pi --name batch-two" },
+    ],
+  });
+  const secondNormal = backend.spawn({
+    cwd: "/repo",
+    command: "pi --name normal-two",
+  });
+
+  assert.equal(normal.paneId, "agent-root-1");
+  assert.equal(batch?.tabId, "tab-agents-2");
+  assert.equal(secondNormal.paneId, "agent-child-3");
+  assert.equal(
+    hasCall(calls, [
+      "pane",
+      "split",
+      "agent-root-1",
+      "--direction",
+      "right",
+      "--ratio",
+      "0.5",
+      "--cwd",
+      "/repo",
+      "--no-focus",
+    ]),
+    true,
+  );
+
+  backend.finalize(batch?.items[0]?.paneId, "parent-1", "completed");
+  backend.rollbackSpawn(batch?.items[1]?.paneId);
+
+  assert.equal(hasCall(calls, ["pane", "close", batch?.items[1]?.paneId ?? ""]), true);
+  assert.equal(hasCall(calls, ["pane", "close", normal.paneId]), false);
+});
+
+test("Herdr adopts restored panes into multiple waves and uses the newest as current", () => {
+  const calls: string[][] = [];
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    if (arrayEqual(args, ["pane", "list"])) {
+      return JSON.stringify({
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+            {
+              pane_id: "old-a",
+              tab_id: "tab-old",
+              workspace_id: "workspace-1",
+              focused: false,
+            },
+            {
+              pane_id: "new-a",
+              tab_id: "tab-new",
+              workspace_id: "workspace-1",
+              focused: false,
+            },
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({
+        result: {
+          tabs: [
+            { tab_id: "tab-old", workspace_id: "workspace-1", label: "Agents 1" },
+            { tab_id: "tab-new", workspace_id: "workspace-1", label: "Agents 2" },
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["pane", "layout", "--pane", "new-a"])) {
+      return layoutResponse([
+        {
+          paneId: "new-a",
+          tabId: "tab-new",
+          x: 0,
+          y: 0,
+          width: 160,
+          height: 40,
+        },
+      ]);
+    }
+    if (args[0] === "pane" && args[1] === "split") {
+      return JSON.stringify({ result: { pane: { pane_id: "new-b" } } });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (args[0] === "pane" && args[1] === "run") return "";
+    throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+  });
+
+  backend.adoptRestoredPanes([
+    { paneId: "old-a", startedAt: 10 },
+    { paneId: "new-a", startedAt: 20 },
+  ]);
+
+  assert.deepEqual(
+    backend.spawn({ cwd: "/repo", command: "pi --name adopted" }),
+    { paneId: "new-b", originalPane: "parent-1" },
+  );
+  backend.finalize("old-a", "parent-1", "completed");
+  backend.finalize("new-a", "parent-1", "completed");
+  backend.finalize("new-b", "parent-1", "completed");
+
+  assert.equal(
+    hasCall(calls, [
+      "pane",
+      "split",
+      "new-a",
+      "--direction",
+      "right",
+      "--ratio",
+      "0.5",
+      "--cwd",
+      "/repo",
+      "--no-focus",
+    ]),
     true,
   );
 });
