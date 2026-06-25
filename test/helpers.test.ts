@@ -17,12 +17,19 @@ import {
   buildTmuxSplitWindowArgs,
   chooseTmuxSplitDirection,
   formatBackgroundReceipt,
+  formatTaskBatchDetails,
+  formatTaskBatchReceipt,
   TASK_BACKGROUND_DEFAULT,
+  TASK_BATCH_MAX_TASKS,
+  TASK_BATCH_MIN_TASKS,
+  TASK_BATCH_TOOL_DESCRIPTION,
   TASK_RESULT_XML_INSTRUCTIONS,
   TASK_TOOL_DESCRIPTION,
   countToolUses,
   readRecentToolCalls,
   summarizeArgs,
+  validateTaskBatchSize,
+  validateTaskBatchTasks,
   findPiDir,
   loadAgentsFromDir,
   discoverAgents,
@@ -315,6 +322,15 @@ import {
   assert.equal(
     summarizeArgs("webclaw_batch", { urls: ["a", "b", "c"] }),
     "3 urls",
+    t,
+  );
+}
+
+{
+  const t = "summarizeArgs returns count for task_batch";
+  assert.equal(
+    summarizeArgs("task_batch", { tasks: [{}, {}, {}] }),
+    "3 tasks",
     t,
   );
 }
@@ -936,6 +952,163 @@ import {
   assert.ok(
     receipt.includes("completion notification"),
     t + " explains notification",
+  );
+}
+
+{
+  const t = "validateTaskBatchSize accepts supported bounds";
+  assert.deepEqual(
+    validateTaskBatchSize(TASK_BATCH_MIN_TASKS),
+    { ok: true, count: TASK_BATCH_MIN_TASKS },
+    t + " min",
+  );
+  assert.deepEqual(
+    validateTaskBatchSize(TASK_BATCH_MAX_TASKS),
+    { ok: true, count: TASK_BATCH_MAX_TASKS },
+    t + " max",
+  );
+}
+
+{
+  const t = "validateTaskBatchSize rejects outside supported bounds";
+  const empty = validateTaskBatchSize(0);
+  assert.equal(empty.ok, false, t + " empty ok");
+  assert.equal(empty.count, 0, t + " empty count");
+  assert.match(empty.error, /at least 1 task/, t + " empty message");
+
+  const tooMany = validateTaskBatchSize(TASK_BATCH_MAX_TASKS + 1);
+  assert.equal(tooMany.ok, false, t + " too many ok");
+  assert.equal(tooMany.count, TASK_BATCH_MAX_TASKS + 1, t + " too many count");
+  assert.match(tooMany.error, /at most 12 tasks/, t + " too many message");
+}
+
+{
+  const t = "validateTaskBatchTasks normalizes valid task items";
+  const result = validateTaskBatchTasks([
+    {
+      agent_type: " explore ",
+      prompt: " inspect files ",
+      description: " inspect ",
+      backend: "herdr",
+      conversation_id: " batch-a ",
+    },
+  ]);
+
+  assert.equal(result.ok, true, t + " ok");
+  assert.equal(result.count, 1, t + " count");
+  assert.deepEqual(
+    result.ok ? result.tasks[0] : undefined,
+    {
+      agent_type: "explore",
+      prompt: "inspect files",
+      description: "inspect",
+      backend: "herdr",
+      conversation_id: "batch-a",
+    },
+    t + " task",
+  );
+}
+
+{
+  const t = "validateTaskBatchTasks reports item validation failures";
+  const notArray = validateTaskBatchTasks({ tasks: [] });
+  assert.equal(notArray.ok, false, t + " not array");
+  assert.match(notArray.error, /array/, t + " not array message");
+
+  const missingPrompt = validateTaskBatchTasks([
+    { agent_type: "explore", prompt: "", description: "scan" },
+  ]);
+  assert.equal(missingPrompt.ok, false, t + " missing prompt");
+  assert.match(missingPrompt.error, /task 1 requires a non-empty prompt/, t);
+
+  const badBackend = validateTaskBatchTasks([
+    {
+      agent_type: "explore",
+      prompt: "scan",
+      description: "scan",
+      backend: "bogus",
+    },
+  ]);
+  assert.equal(badBackend.ok, false, t + " bad backend");
+  assert.match(badBackend.error, /backend must be/, t + " backend message");
+}
+
+{
+  const t = "formatTaskBatchReceipt returns visible launch details";
+  const receipt = formatTaskBatchReceipt([
+    {
+      taskId: "task-a",
+      agentType: "explore",
+      description: "scan helpers",
+      backend: "herdr",
+      paneId: "w1:p2",
+      sessionName: "task-task-a",
+      artifactDir: "/tmp/.pi/artifacts",
+    },
+    {
+      taskId: "task-b",
+      agentType: "reviewer",
+      description: "review tests",
+      backend: "sdk",
+      sessionName: "task-task-b",
+      artifactDir: "/tmp/.pi/artifacts",
+    },
+  ]);
+
+  assert.ok(receipt.includes("Started 2 background tasks"), t + " heading");
+  assert.ok(receipt.includes("1. task-a (explore)"), t + " first task");
+  assert.ok(receipt.includes("Pane: w1:p2"), t + " pane");
+  assert.ok(receipt.includes("2. task-b (reviewer)"), t + " second task");
+  assert.ok(
+    receipt.includes("Completion notifications"),
+    t + " notification guidance",
+  );
+}
+
+{
+  const t = "formatTaskBatchDetails returns serializable batch details";
+  const details = formatTaskBatchDetails([
+    {
+      taskId: "task-a",
+      agentType: "explore",
+      description: "scan helpers",
+      backend: "tmux",
+      paneId: "%7",
+      sessionName: "task-task-a",
+      artifactDir: "/tmp/.pi/artifacts",
+      conversationId: "helpers-a",
+    },
+  ]);
+
+  assert.equal(details.batch, true, t + " batch");
+  assert.equal(details.background, true, t + " background");
+  assert.equal(details.task_count, 1, t + " count");
+  assert.deepEqual(
+    details.tasks[0],
+    {
+      task_id: "task-a",
+      agent_type: "explore",
+      description: "scan helpers",
+      backend: "tmux",
+      pane_id: "%7",
+      session_name: "task-task-a",
+      artifact_dir: "/tmp/.pi/artifacts",
+      conversation_id: "helpers-a",
+      background: true,
+    },
+    t + " task detail",
+  );
+}
+
+{
+  const t = "task_batch description documents limits and background behavior";
+  assert.ok(
+    TASK_BATCH_TOOL_DESCRIPTION.includes("Launch multiple background task agents"),
+    t + " background",
+  );
+  assert.ok(
+    TASK_BATCH_TOOL_DESCRIPTION.includes(`${TASK_BATCH_MIN_TASKS}-${TASK_BATCH_MAX_TASKS}`),
+    t + " limits",
   );
 }
 

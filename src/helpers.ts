@@ -77,6 +77,8 @@ export interface ToolCallRecord {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 export const TASK_BACKGROUND_DEFAULT = true;
+export const TASK_BATCH_MIN_TASKS = 1;
+export const TASK_BATCH_MAX_TASKS = 12;
 
 export const TASK_RESULT_XML_INSTRUCTIONS = `<status>success|failure|blocked|partial</status>
 <summary>One sentence: what was accomplished</summary>
@@ -116,6 +118,22 @@ Background mode (background: true):
 - DO NOT sleep, poll, ask the task for status, or duplicate its work while it runs in background
 - Avoid working with the same files or topics the background task is using
 - Work on non-overlapping tasks, or briefly tell the user what you launched and end your response`;
+
+export const TASK_BATCH_TOOL_DESCRIPTION = `Launch multiple background task agents in one tool call.
+
+Use task_batch when you have independent, non-overlapping work that should run concurrently. Each task gets its own agent, prompt, description, session, and completion notification.
+
+Limits:
+- Provide ${TASK_BATCH_MIN_TASKS}-${TASK_BATCH_MAX_TASKS} tasks
+- Tasks must be independent enough to run at the same time
+- Background execution is required; use task for foreground or resume workflows
+
+Usage notes:
+1. Put complete, self-contained instructions in each task prompt
+2. Assign the right agent_type per task
+3. Keep descriptions short and distinct so results are easy to identify
+4. Do not duplicate delegated work while the batch runs
+5. Review each completion result before reporting final conclusions to the user`;
 
 /** @deprecated Import from ./agent-tools.js */
 export { ALL_TOOL_NAMES, BUILTIN_TOOL_NAMES } from "./agent-tools.js";
@@ -224,10 +242,13 @@ export function buildTmuxSplitWindowArgs(
   return args;
 }
 
+export type TaskBackendName = "tmux" | "herdr" | "sdk";
+export type TaskBatchRequestedBackendName = TaskBackendName | "auto";
+
 export interface BackgroundReceiptInput {
   taskId: string;
   agentType: string;
-  backend: "tmux" | "herdr" | "sdk";
+  backend: TaskBackendName;
   paneId?: string;
   sessionName: string;
   artifactDir: string;
@@ -242,6 +263,262 @@ export function formatBackgroundReceipt(input: BackgroundReceiptInput): string {
     `Artifact directory: ${input.artifactDir}.`,
     "A completion notification will arrive automatically; do not poll or duplicate this work.",
   ].join("\n");
+}
+
+export interface TaskBatchRequestItem {
+  agent_type: string;
+  prompt: string;
+  description: string;
+  backend?: TaskBatchRequestedBackendName;
+  conversation_id?: string;
+}
+
+export type TaskBatchSizeValidationResult =
+  | { ok: true; count: number }
+  | {
+      ok: false;
+      count: number;
+      minTasks: number;
+      maxTasks: number;
+      error: string;
+    };
+
+export type TaskBatchValidationResult =
+  | { ok: true; count: number; tasks: TaskBatchRequestItem[] }
+  | {
+      ok: false;
+      count: number;
+      minTasks: number;
+      maxTasks: number;
+      error: string;
+    };
+
+export interface TaskBatchStartedTask {
+  taskId: string;
+  agentType: string;
+  description: string;
+  backend: TaskBackendName;
+  paneId?: string;
+  sessionName: string;
+  artifactDir: string;
+  conversationId?: string;
+}
+
+export interface TaskBatchTaskDetails {
+  task_id: string;
+  agent_type: string;
+  description: string;
+  backend: TaskBackendName;
+  pane_id?: string;
+  session_name: string;
+  artifact_dir: string;
+  conversation_id?: string;
+  background: true;
+}
+
+export interface TaskBatchDetails {
+  batch: true;
+  background: true;
+  task_count: number;
+  tasks: TaskBatchTaskDetails[];
+}
+
+export function validateTaskBatchSize(
+  count: number,
+): TaskBatchSizeValidationResult {
+  if (!Number.isInteger(count)) {
+    return {
+      ok: false,
+      count,
+      minTasks: TASK_BATCH_MIN_TASKS,
+      maxTasks: TASK_BATCH_MAX_TASKS,
+      error: `task_batch task count must be an integer between ${TASK_BATCH_MIN_TASKS} and ${TASK_BATCH_MAX_TASKS}.`,
+    };
+  }
+
+  if (count < TASK_BATCH_MIN_TASKS) {
+    return {
+      ok: false,
+      count,
+      minTasks: TASK_BATCH_MIN_TASKS,
+      maxTasks: TASK_BATCH_MAX_TASKS,
+      error: `task_batch requires at least ${TASK_BATCH_MIN_TASKS} task.`,
+    };
+  }
+
+  if (count > TASK_BATCH_MAX_TASKS) {
+    return {
+      ok: false,
+      count,
+      minTasks: TASK_BATCH_MIN_TASKS,
+      maxTasks: TASK_BATCH_MAX_TASKS,
+      error: `task_batch accepts at most ${TASK_BATCH_MAX_TASKS} tasks.`,
+    };
+  }
+
+  return { ok: true, count };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+export function validateTaskBatchTasks(
+  tasks: unknown,
+): TaskBatchValidationResult {
+  if (!Array.isArray(tasks)) {
+    return {
+      ok: false,
+      count: 0,
+      minTasks: TASK_BATCH_MIN_TASKS,
+      maxTasks: TASK_BATCH_MAX_TASKS,
+      error: "task_batch requires tasks to be an array.",
+    };
+  }
+
+  const size = validateTaskBatchSize(tasks.length);
+  if (!size.ok) return size;
+
+  const normalized: TaskBatchRequestItem[] = [];
+  const validBackends = new Set<TaskBatchRequestedBackendName>([
+    "auto",
+    "herdr",
+    "tmux",
+    "sdk",
+  ]);
+
+  for (let index = 0; index < tasks.length; index++) {
+    const task = tasks[index];
+    const label = `task ${index + 1}`;
+    if (!isPlainRecord(task)) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} must be an object.`,
+      };
+    }
+
+    if (!nonEmptyString(task.agent_type)) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} requires a non-empty agent_type.`,
+      };
+    }
+    if (!nonEmptyString(task.prompt)) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} requires a non-empty prompt.`,
+      };
+    }
+    if (!nonEmptyString(task.description)) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} requires a non-empty description.`,
+      };
+    }
+
+    if (
+      task.backend !== undefined &&
+      (!nonEmptyString(task.backend) ||
+        !validBackends.has(task.backend as TaskBatchRequestedBackendName))
+    ) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} backend must be auto, herdr, tmux, or sdk.`,
+      };
+    }
+
+    if (
+      task.conversation_id !== undefined &&
+      !nonEmptyString(task.conversation_id)
+    ) {
+      return {
+        ok: false,
+        count: tasks.length,
+        minTasks: TASK_BATCH_MIN_TASKS,
+        maxTasks: TASK_BATCH_MAX_TASKS,
+        error: `${label} conversation_id must be a non-empty string when provided.`,
+      };
+    }
+
+    normalized.push({
+      agent_type: task.agent_type.trim(),
+      prompt: task.prompt.trim(),
+      description: task.description.trim(),
+      backend: task.backend as TaskBatchRequestedBackendName | undefined,
+      conversation_id:
+        typeof task.conversation_id === "string"
+          ? task.conversation_id.trim()
+          : undefined,
+    });
+  }
+
+  return { ok: true, count: normalized.length, tasks: normalized };
+}
+
+export function formatTaskBatchReceipt(
+  tasks: readonly TaskBatchStartedTask[],
+): string {
+  const size = validateTaskBatchSize(tasks.length);
+  const heading = size.ok
+    ? `Started ${tasks.length} background ${tasks.length === 1 ? "task" : "tasks"}.`
+    : `Started ${tasks.length} background tasks.`;
+  const lines = [heading];
+
+  for (const [index, task] of tasks.entries()) {
+    const description = task.description ? ` - ${task.description}` : "";
+    lines.push(
+      `${index + 1}. ${task.taskId} (${task.agentType})${description}`,
+      `   Backend: ${task.backend}.`,
+      ...(task.paneId ? [`   Pane: ${task.paneId}.`] : []),
+      `   Session: ${task.sessionName}.`,
+      `   Artifact directory: ${task.artifactDir}.`,
+    );
+  }
+
+  lines.push(
+    "Completion notifications will arrive automatically; do not poll or duplicate this work.",
+  );
+  return lines.join("\n");
+}
+
+export function formatTaskBatchDetails(
+  tasks: readonly TaskBatchStartedTask[],
+): TaskBatchDetails {
+  return {
+    batch: true,
+    background: true,
+    task_count: tasks.length,
+    tasks: tasks.map((task) => ({
+      task_id: task.taskId,
+      agent_type: task.agentType,
+      description: task.description,
+      backend: task.backend,
+      pane_id: task.paneId,
+      session_name: task.sessionName,
+      artifact_dir: task.artifactDir,
+      conversation_id: task.conversationId,
+      background: true,
+    })),
+  };
 }
 
 // ─── Agent Discovery ─────────────────────────────────────────────────────────
@@ -493,6 +770,8 @@ export function summarizeArgs(toolName: string, args: unknown): string {
       return pick("url");
     case "webclaw_batch":
       return Array.isArray(a.urls) ? `${a.urls.length} urls` : pick("urls");
+    case "task_batch":
+      return Array.isArray(a.tasks) ? `${a.tasks.length} tasks` : pick("tasks");
     case "context7":
       return pick("libraryId", "topic", "libraryName");
     case "deepwiki":
