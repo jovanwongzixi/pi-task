@@ -5,11 +5,56 @@ import {
   type SubagentPaneBackend,
 } from "../src/subagent/backend.js";
 import {
+  chooseHerdrSplitDirection,
   HerdrBackend,
+  parseCreatedHerdrTab,
+  parseHerdrLayoutPanes,
   parseHerdrPanes,
+  parseHerdrTabs,
   parseSplitHerdrPaneId,
+  selectLargestHerdrLayoutPane,
 } from "../src/subagent/herdr.js";
 import { TmuxBackend } from "../src/subagent/tmux.js";
+
+type SubagentOutcome =
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "cancelled"
+  | "tracking-error";
+
+type LifecyclePaneBackend = {
+  finalize(
+    paneId: string | undefined,
+    originalPane: string | null | undefined,
+    outcome: SubagentOutcome,
+  ): void;
+  rollbackSpawn(paneId?: string): void;
+};
+
+type HerdrBackendContract = HerdrBackend & LifecyclePaneBackend;
+type TmuxBackendContract = TmuxBackend & LifecyclePaneBackend;
+
+function hasCall(calls: string[][], expected: string[]): boolean {
+  return calls.some((call) => arrayEqual(call, expected));
+}
+
+function arrayEqual(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+function herdrBackend(command: (args: string[]) => string): HerdrBackendContract {
+  return new HerdrBackend(command) as HerdrBackendContract;
+}
+
+function tmuxBackend(
+  command: (args: string[], input?: string) => string,
+): TmuxBackendContract {
+  return new TmuxBackend(command) as TmuxBackendContract;
+}
 
 function fakeBackend(
   name: "herdr" | "tmux",
@@ -28,6 +73,8 @@ function fakeBackend(
     exists() {
       return false;
     },
+    finalize() {},
+    rollbackSpawn() {},
     kill() {},
     steer() {},
   };
@@ -141,39 +188,534 @@ test("Herdr JSON parsers reject malformed responses", () => {
   );
 });
 
-test("Herdr spawn lists, splits, and runs with exact command arguments", () => {
+test("Herdr JSON parsers extract tab create, tab list, and pane layout responses", () => {
+  assert.deepEqual(
+    parseCreatedHerdrTab(
+      JSON.stringify({
+        result: {
+          tab: {
+            tab_id: "tab-agents-1",
+            workspace_id: "workspace-1",
+            label: "Agents 1",
+          },
+          root_pane: {
+            pane_id: "root-pane-1",
+            tab_id: "tab-agents-1",
+          },
+        },
+      }),
+    ),
+    { tabId: "tab-agents-1", rootPaneId: "root-pane-1" },
+  );
+  assert.deepEqual(
+    parseHerdrTabs(
+      JSON.stringify({
+        result: {
+          tabs: [
+            {
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              label: "Main",
+              pane_count: 1,
+            },
+            {
+              tab_id: "tab-agents-2",
+              workspace_id: "workspace-1",
+              label: "Agents 2",
+              pane_count: 3,
+            },
+          ],
+        },
+      }),
+    ),
+    [
+      {
+        tab_id: "tab-main",
+        workspace_id: "workspace-1",
+        label: "Main",
+        pane_count: 1,
+      },
+      {
+        tab_id: "tab-agents-2",
+        workspace_id: "workspace-1",
+        label: "Agents 2",
+        pane_count: 3,
+      },
+    ],
+  );
+  assert.deepEqual(
+    (() => {
+      const panes = parseHerdrLayoutPanes(
+        JSON.stringify({
+          result: {
+            layout: {
+              panes: [
+                { pane_id: "pane-small", x: 0, y: 0, width: 80, height: 24 },
+                { pane_id: "pane-large", x: 80, y: 0, width: 120, height: 48 },
+              ],
+            },
+          },
+        }),
+      );
+      assert.equal(selectLargestHerdrLayoutPane(panes).paneId, "pane-large");
+      return panes;
+    })(),
+    [
+      { paneId: "pane-small", width: 80, height: 24, area: 1920 },
+      { paneId: "pane-large", width: 120, height: 48, area: 5760 },
+    ],
+  );
+});
+
+test("Herdr split direction uses width >= 2 * height for right splits", () => {
+  assert.equal(chooseHerdrSplitDirection(120, 60), "right");
+  assert.equal(chooseHerdrSplitDirection(119, 60), "down");
+  assert.equal(chooseHerdrSplitDirection(80, 80), "down");
+});
+
+test("Herdr spawn creates a new task tab for the first task in a wave", () => {
   const calls: string[][] = [];
-  const backend = new HerdrBackend((args) => {
+  const backend = herdrBackend((args) => {
     calls.push(args);
-    if (args[1] === "list") {
+    if (arrayEqual(args, ["pane", "list"])) {
       return JSON.stringify({
-        result: { panes: [{ pane_id: "parent-1", focused: true }] },
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+          ],
+        },
       });
     }
-    if (args[1] === "split") {
-      return JSON.stringify({ result: { pane: { pane_id: "child-1" } } });
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({ result: { tabs: [] } });
+    }
+    if (args[0] === "tab" && args[1] === "create") {
+      return JSON.stringify({
+        result: {
+          tab: {
+            tab_id: "tab-agents-1",
+            workspace_id: "workspace-1",
+            label: "Agents 1",
+          },
+          root_pane: {
+            pane_id: "agent-root-1",
+            tab_id: "tab-agents-1",
+            workspace_id: "workspace-1",
+          },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (arrayEqual(args, ["pane", "run", "agent-root-1", "pi --name first"])) {
+      return "";
+    }
+    throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+  });
+
+  assert.deepEqual(
+    backend.spawn({ cwd: "/repo with spaces", command: "pi --name first" }),
+    { paneId: "agent-root-1", originalPane: "parent-1" },
+  );
+  assert.equal(
+    hasCall(calls, [
+      "tab",
+      "create",
+      "--workspace",
+      "workspace-1",
+      "--cwd",
+      "/repo with spaces",
+      "--label",
+      "Agents 1",
+      "--no-focus",
+    ]),
+    true,
+  );
+  assert.equal(
+    hasCall(calls, ["pane", "run", "agent-root-1", "pi --name first"]),
+    true,
+  );
+  assert.equal(calls.some((call) => call[1] === "split"), false);
+});
+
+test("Herdr spawn reuses an active wave tab and splits the largest pane at ratio 0.5", () => {
+  const calls: string[][] = [];
+  let createdFirstTab = false;
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    if (arrayEqual(args, ["pane", "list"])) {
+      const panes = [
+        {
+          pane_id: "parent-1",
+          tab_id: "tab-main",
+          workspace_id: "workspace-1",
+          focused: true,
+        },
+      ];
+      if (createdFirstTab) {
+        panes.push({
+          pane_id: "agent-root-1",
+          tab_id: "tab-agents-1",
+          workspace_id: "workspace-1",
+          focused: false,
+        });
+      }
+      return JSON.stringify({
+        result: {
+          panes,
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({
+        result: {
+          tabs: createdFirstTab
+            ? [
+                {
+                  tab_id: "tab-agents-1",
+                  workspace_id: "workspace-1",
+                  label: "Agents 1",
+                  pane_count: 1,
+                },
+              ]
+            : [],
+        },
+      });
+    }
+    if (args[0] === "tab" && args[1] === "create") {
+      createdFirstTab = true;
+      return JSON.stringify({
+        result: {
+          tab: { tab_id: "tab-agents-1", workspace_id: "workspace-1" },
+          root_pane: { pane_id: "agent-root-1", tab_id: "tab-agents-1" },
+        },
+      });
+    }
+    if (arrayEqual(args, ["pane", "layout", "--pane", "agent-root-1"])) {
+      return JSON.stringify({
+        result: {
+          layout: {
+            panes: [
+              { pane_id: "small-pane", x: 0, y: 0, width: 80, height: 30 },
+              { pane_id: "largest-pane", x: 80, y: 0, width: 160, height: 40 },
+            ],
+          },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "split") {
+      return JSON.stringify({ result: { pane: { pane_id: "agent-child-2" } } });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (args[0] === "pane" && args[1] === "run") return "";
+    return "";
+  });
+
+  assert.deepEqual(
+    backend.spawn({ cwd: "/repo", command: "pi --name first" }),
+    { paneId: "agent-root-1", originalPane: "parent-1" },
+  );
+  assert.deepEqual(
+    backend.spawn({ cwd: "/repo", command: "pi --name second" }),
+    { paneId: "agent-child-2", originalPane: "parent-1" },
+  );
+  assert.equal(
+    hasCall(calls, [
+      "pane",
+      "split",
+      "largest-pane",
+      "--direction",
+      "right",
+      "--ratio",
+      "0.5",
+      "--cwd",
+      "/repo",
+      "--no-focus",
+    ]),
+    true,
+  );
+  assert.equal(
+    hasCall(calls, ["pane", "run", "agent-child-2", "pi --name second"]),
+    true,
+  );
+});
+
+test("Herdr starts a new tab after all tasks in the previous wave finalize", () => {
+  const calls: string[][] = [];
+  let tabCreateCount = 0;
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    if (arrayEqual(args, ["pane", "list"])) {
+      return JSON.stringify({
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({
+        result: {
+          tabs: [
+            {
+              tab_id: "tab-agents-1",
+              workspace_id: "workspace-1",
+              label: "Agents 1",
+              pane_count: 1,
+            },
+          ],
+        },
+      });
+    }
+    if (args[0] === "tab" && args[1] === "create") {
+      tabCreateCount++;
+      return JSON.stringify({
+        result: {
+          tab: {
+            tab_id: `tab-agents-${tabCreateCount}`,
+            workspace_id: "workspace-1",
+          },
+          root_pane: {
+            pane_id: `agent-root-${tabCreateCount}`,
+            tab_id: `tab-agents-${tabCreateCount}`,
+          },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (args[0] === "pane" && args[1] === "run") return "";
+    return "";
+  });
+
+  const first = backend.spawn({ cwd: "/repo", command: "pi --name first" });
+  backend.finalize(first.paneId, first.originalPane, "completed");
+  const second = backend.spawn({ cwd: "/repo", command: "pi --name second" });
+
+  assert.deepEqual(first, { paneId: "agent-root-1", originalPane: "parent-1" });
+  assert.deepEqual(second, { paneId: "agent-root-2", originalPane: "parent-1" });
+  assert.equal(
+    calls.filter((call) => call[0] === "tab" && call[1] === "create").length,
+    2,
+  );
+  assert.equal(hasCall(calls, ["pane", "close", "agent-root-1"]), false);
+});
+
+test("Herdr finalize retains completed and failed panes", () => {
+  for (const outcome of ["completed", "failed"] as const) {
+    const calls: string[][] = [];
+    const backend = herdrBackend((args) => {
+      calls.push(args);
+      return "";
+    });
+
+    backend.finalize("agent-pane", "parent-pane", outcome);
+
+    assert.equal(hasCall(calls, ["pane", "close", "agent-pane"]), false);
+    assert.equal(
+      hasCall(calls, ["pane", "send-keys", "agent-pane", "ctrl+c"]),
+      false,
+    );
+  }
+});
+
+test("Herdr finalize sends Ctrl+C but does not close for interrupted outcomes", () => {
+  for (const outcome of ["timeout", "cancelled", "tracking-error"] as const) {
+    const calls: string[][] = [];
+    const backend = herdrBackend((args) => {
+      calls.push(args);
+      if (arrayEqual(args, ["pane", "list"])) {
+        return JSON.stringify({
+          result: { panes: [{ pane_id: "agent-pane" }] },
+        });
+      }
+      return "";
+    });
+
+    backend.finalize("agent-pane", "parent-pane", outcome);
+
+    assert.equal(
+      hasCall(calls, ["pane", "send-keys", "agent-pane", "ctrl+c"]),
+      true,
+    );
+    assert.equal(hasCall(calls, ["pane", "close", "agent-pane"]), false);
+  }
+});
+
+test("Herdr rollback closes a pane created by a failed spawn", () => {
+  const calls: string[][] = [];
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    return "";
+  });
+
+  backend.rollbackSpawn("agent-pane");
+
+  assert.deepEqual(calls, [["pane", "close", "agent-pane"]]);
+});
+
+test("Herdr adopts restored active panes into the current wave", () => {
+  const calls: string[][] = [];
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    if (arrayEqual(args, ["pane", "list"])) {
+      return JSON.stringify({
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+            {
+              pane_id: "restored-a",
+              tab_id: "tab-restored",
+              workspace_id: "workspace-1",
+              focused: false,
+            },
+            {
+              pane_id: "restored-b",
+              tab_id: "tab-restored",
+              workspace_id: "workspace-1",
+              focused: false,
+            },
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({
+        result: {
+          tabs: [
+            {
+              tab_id: "tab-restored",
+              workspace_id: "workspace-1",
+              label: "Agents 4",
+              pane_count: 2,
+            },
+          ],
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "layout") {
+      return JSON.stringify({
+        result: {
+          layout: {
+            panes: [
+              { pane_id: "restored-a", x: 0, y: 0, width: 80, height: 40 },
+              { pane_id: "restored-b", x: 80, y: 0, width: 160, height: 40 },
+            ],
+          },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "split") {
+      return JSON.stringify({ result: { pane: { pane_id: "agent-child-3" } } });
+    }
+    if (args[0] === "pane" && args[1] === "rename") return "";
+    if (args[0] === "pane" && args[1] === "run") return "";
+    throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+  });
+
+  assert.equal(
+    typeof backend.adoptRestoredPanes,
+    "function",
+    "Expected HerdrBackend.adoptRestoredPanes(entries) to adopt active restored panes",
+  );
+  backend.adoptRestoredPanes([
+    { paneId: "restored-a", startedAt: 1 },
+    { paneId: "restored-b", startedAt: 2 },
+  ]);
+
+  assert.deepEqual(
+    backend.spawn({ cwd: "/repo", command: "pi --name restored-wave" }),
+    { paneId: "agent-child-3", originalPane: "parent-1" },
+  );
+  assert.equal(
+    hasCall(calls, [
+      "pane",
+      "split",
+      "restored-b",
+      "--direction",
+      "right",
+      "--ratio",
+      "0.5",
+      "--cwd",
+      "/repo",
+      "--no-focus",
+    ]),
+    true,
+  );
+  assert.equal(
+    calls.some((call) => call[0] === "tab" && call[1] === "create"),
+    false,
+  );
+});
+
+test("Herdr pane label failures do not fail task launch", () => {
+  const calls: string[][] = [];
+  const backend = herdrBackend((args) => {
+    calls.push(args);
+    if (arrayEqual(args, ["pane", "list"])) {
+      return JSON.stringify({
+        result: {
+          panes: [
+            {
+              pane_id: "parent-1",
+              tab_id: "tab-main",
+              workspace_id: "workspace-1",
+              focused: true,
+            },
+          ],
+        },
+      });
+    }
+    if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-1"])) {
+      return JSON.stringify({ result: { tabs: [] } });
+    }
+    if (args[0] === "tab" && args[1] === "create") {
+      return JSON.stringify({
+        result: {
+          tab: { tab_id: "tab-agents-1", workspace_id: "workspace-1" },
+          root_pane: { pane_id: "agent-root-1", tab_id: "tab-agents-1" },
+        },
+      });
+    }
+    if (args[0] === "pane" && args[1] === "rename") {
+      throw new Error("rename is unavailable");
+    }
+    if (arrayEqual(args, ["pane", "run", "agent-root-1", "pi --name worker"])) {
+      return "";
     }
     return "";
   });
 
   assert.deepEqual(
-    backend.spawn({ cwd: "/repo with spaces", command: "pi --name worker" }),
-    { paneId: "child-1", originalPane: "parent-1" },
+    backend.spawn({
+      cwd: "/repo",
+      command: "pi --name worker",
+      description: "Investigate flaky tests with a label",
+    }),
+    { paneId: "agent-root-1", originalPane: "parent-1" },
   );
-  assert.deepEqual(calls, [
-    ["pane", "list"],
-    [
-      "pane",
-      "split",
-      "parent-1",
-      "--direction",
-      "right",
-      "--cwd",
-      "/repo with spaces",
-      "--no-focus",
-    ],
-    ["pane", "run", "child-1", "pi --name worker"],
-  ]);
+  assert.equal(
+    calls.some((call) => call[0] === "pane" && call[1] === "rename"),
+    true,
+  );
+  assert.equal(
+    hasCall(calls, ["pane", "run", "agent-root-1", "pi --name worker"]),
+    true,
+  );
 });
 
 test("Herdr spawn requires a focused pane", () => {
@@ -186,7 +728,7 @@ test("Herdr spawn requires a focused pane", () => {
   );
 });
 
-test("Herdr exists, kill, and steer construct expected commands", () => {
+test("Herdr exists and steer construct expected commands", () => {
   const calls: string[][] = [];
   const backend = new HerdrBackend((args) => {
     calls.push(args);
@@ -200,14 +742,11 @@ test("Herdr exists, kill, and steer construct expected commands", () => {
 
   assert.equal(backend.exists("child-2"), true);
   assert.equal(backend.exists("missing"), false);
-  backend.kill("child-1");
-  backend.kill();
   backend.steer("child-2", "continue with 'quotes'");
 
   assert.deepEqual(calls, [
     ["pane", "list"],
     ["pane", "list"],
-    ["pane", "close", "child-1"],
     ["pane", "send-text", "child-2", "continue with 'quotes'"],
     ["pane", "send-keys", "child-2", "Enter"],
   ]);
@@ -233,6 +772,41 @@ test("Herdr availability requires HERDR_ENV and a successful pane list", () => {
     if (previous === undefined) delete process.env.HERDR_ENV;
     else process.env.HERDR_ENV = previous;
   }
+});
+
+test("Tmux finalize preserves cleanup behavior for every outcome", () => {
+  for (const outcome of [
+    "completed",
+    "failed",
+    "timeout",
+    "cancelled",
+    "tracking-error",
+  ] as const) {
+    const calls: string[][] = [];
+    const backend = tmuxBackend((args) => {
+      calls.push(args);
+      return "";
+    });
+
+    backend.finalize("%child", "%parent", outcome);
+
+    assert.deepEqual(calls, [
+      ["kill-pane", "-t", "%child"],
+      ["select-pane", "-t", "%parent"],
+    ]);
+  }
+});
+
+test("Tmux rollback closes a pane created by a failed spawn", () => {
+  const calls: string[][] = [];
+  const backend = tmuxBackend((args) => {
+    calls.push(args);
+    return "";
+  });
+
+  backend.rollbackSpawn("%child");
+
+  assert.deepEqual(calls, [["kill-pane", "-t", "%child"]]);
 });
 
 test("Tmux exists checks the pane list", () => {
