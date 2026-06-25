@@ -39,9 +39,14 @@ import {
 import {
   type ToolCallRecord,
   TASK_BACKGROUND_DEFAULT,
+  TASK_BATCH_MAX_TASKS,
+  TASK_BATCH_MIN_TASKS,
+  TASK_BATCH_TOOL_DESCRIPTION,
   TASK_RESULT_XML_INSTRUCTIONS,
   TASK_TOOL_DESCRIPTION,
   formatBackgroundReceipt,
+  formatTaskBatchDetails,
+  formatTaskBatchReceipt,
   buildPiArgs,
   parseResultXml,
   formatMs,
@@ -50,6 +55,9 @@ import {
   formatAgentList,
   countToolUses,
   readRecentToolCalls,
+  validateTaskBatchTasks,
+  type AgentConfig,
+  type TaskBatchStartedTask,
 } from "./helpers.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import {
@@ -103,6 +111,10 @@ interface BackgroundTask {
   toolUses: number;
   turns: number;
   conversationId?: string;
+  batchId?: string;
+  batchLabel?: string;
+  batchIndex?: number;
+  batchSize?: number;
   /** Most recent tool calls (capped), updated every COUNT_POLL_MS. */
   recentCalls: ToolCallRecord[];
   /** Consecutive completion-poll failures; reset to 0 on a successful poll. */
@@ -124,6 +136,10 @@ interface RegistryEntry {
   conversationId?: string;
   sessionRef?: string;
   backend?: SubagentBackendName;
+  batchId?: string;
+  batchLabel?: string;
+  batchIndex?: number;
+  batchSize?: number;
 }
 
 /** Durable task→session mapping used for resume after task completion. */
@@ -154,6 +170,10 @@ interface TaskDetails {
   backend?: SubagentBackendName;
   pane_id?: string;
   session_name?: string;
+  batch_id?: string;
+  batch_label?: string;
+  batch_index?: number;
+  batch_size?: number;
   /** @deprecated Retained when reading older tool results. */
   tmux_session?: string;
 }
@@ -348,6 +368,10 @@ function completeTask(
     dir: task.dir,
     conversationId: task.conversationId,
     sessionRef: completedSessionRef,
+    batchId: task.batchId,
+    batchLabel: task.batchLabel,
+    batchIndex: task.batchIndex,
+    batchSize: task.batchSize,
     status: phase,
     completedAt: Date.now(),
     background: true,
@@ -372,6 +396,10 @@ function completeTask(
         backend: task.backend,
         pane_id: task.paneId,
         session_name: task.sessionName,
+        batch_id: task.batchId,
+        batch_label: task.batchLabel,
+        batch_index: task.batchIndex,
+        batch_size: task.batchSize,
         duration_ms: durationMs,
         tool_uses: task.toolUses,
         turn_count: task.turns,
@@ -429,6 +457,10 @@ export default function (pi: ExtensionAPI) {
       toolUses: 0,
       turns: 0,
       conversationId: entry.conversationId,
+      batchId: entry.batchId,
+      batchLabel: entry.batchLabel,
+      batchIndex: entry.batchIndex,
+      batchSize: entry.batchSize,
       recentCalls: [],
     };
 
@@ -696,6 +728,258 @@ export default function (pi: ExtensionAPI) {
       return new Text(line, 0, 1, subtleBg);
     },
   );
+
+  interface PreparedBatchTask {
+    id: string;
+    agent: AgentConfig;
+    agentType: string;
+    prompt: string;
+    description: string;
+    sessionName: string;
+    promptContent: string;
+    shellCommand: string;
+    runSdk: () => Promise<{ output: string; sessionPath?: string }>;
+  }
+
+  interface RegisteredBatchTaskInput {
+    prepared: PreparedBatchTask;
+    backend: SubagentBackendName;
+    paneId?: string;
+    originalPane: string | null;
+    piDir: string;
+    artifactsDir: string;
+    batchId: string;
+    batchLabel?: string;
+    batchIndex: number;
+    batchSize: number;
+  }
+
+  function newTaskId(): string {
+    return `${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
+  }
+
+  function buildTaskPromptContent(input: {
+    agent: AgentConfig;
+    prompt: string;
+    description: string;
+    cwd: string;
+  }): string {
+    return [
+      `# Task: ${input.description}`,
+      "",
+      `## Agent`,
+      `${input.agent.name} (${input.agent.source})`,
+      "",
+      `## Instructions`,
+      input.prompt,
+      "",
+      `## Working Directory`,
+      input.cwd,
+      "",
+      `## Output`,
+      "Your final assistant message is the result. End with a clear summary of what you did and any findings. No file write is required.",
+      "",
+      "Use this format for the summary:",
+      "",
+      "```",
+      TASK_RESULT_XML_INSTRUCTIONS,
+      "```",
+    ].join("\n");
+  }
+
+  async function prepareBatchTask(input: {
+    agent: AgentConfig;
+    prompt: string;
+    description: string;
+    cwd: string;
+    artifactsDir: string;
+    sessionDir: string;
+    parentToolNames: string[];
+    ctx: ExtensionContext;
+  }): Promise<PreparedBatchTask> {
+    const id = newTaskId();
+    const sessionName = `task-${id}`;
+    const promptContent = buildTaskPromptContent({
+      agent: input.agent,
+      prompt: input.prompt,
+      description: input.description,
+      cwd: input.cwd,
+    });
+    const piArgs = buildPiArgs(
+      input.agent,
+      sessionName,
+      input.sessionDir,
+      promptContent,
+      false,
+      input.parentToolNames,
+    );
+    const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+    const toolSelection = buildAgentToolSelection({
+      tools: input.agent.tools,
+      disallowedTools: input.agent.disallowedTools,
+      parentToolNames: input.parentToolNames,
+    });
+    const runSdk = () =>
+      runSdkSubagent({
+        prompt: promptContent,
+        agent: input.agent,
+        cwd: input.cwd,
+        ctx: input.ctx,
+        model: input.agent.model,
+        thinkingLevel: input.agent.thinking,
+        tools: toolSelection.tools,
+        excludeTools: toolSelection.excludeTools,
+        systemPrompt: input.agent.body,
+      });
+
+    return {
+      id,
+      agent: input.agent,
+      agentType: input.agent.name,
+      prompt: input.prompt,
+      description: input.description,
+      sessionName,
+      promptContent,
+      shellCommand,
+      runSdk,
+    };
+  }
+
+  function registerBackgroundBatchTask(input: RegisteredBatchTaskInput): {
+    task: BackgroundTask;
+    entry: RegistryEntry;
+    started: TaskBatchStartedTask;
+  } {
+    const startedAt = Date.now();
+    const task: BackgroundTask = {
+      backend: input.backend,
+      dir: input.artifactsDir,
+      agentType: input.prepared.agentType,
+      sessionName: input.prepared.sessionName,
+      paneId: input.paneId,
+      originalPane: input.originalPane,
+      description: input.prepared.description,
+      startedAt,
+      toolUses: 0,
+      turns: 0,
+      recentCalls: [],
+      batchId: input.batchId,
+      batchLabel: input.batchLabel,
+      batchIndex: input.batchIndex,
+      batchSize: input.batchSize,
+    };
+    backgroundTasks.set(input.prepared.id, task);
+
+    const entry: RegistryEntry = {
+      id: input.prepared.id,
+      agentType: input.prepared.agentType,
+      description: input.prepared.description,
+      sessionName: input.prepared.sessionName,
+      startedAt,
+      paneId: input.paneId,
+      piDir: input.piDir,
+      dir: input.artifactsDir,
+      backend: input.backend,
+      batchId: input.batchId,
+      batchLabel: input.batchLabel,
+      batchIndex: input.batchIndex,
+      batchSize: input.batchSize,
+    };
+
+    const entries = readRegistry(input.piDir);
+    entries.push(entry);
+    writeRegistry(input.piDir, entries);
+    upsertTaskSessionHistory(input.piDir, {
+      ...entry,
+      status: "running",
+      background: true,
+    });
+    pi.appendEntry("task-registry", entry);
+
+    return {
+      task,
+      entry,
+      started: {
+        taskId: input.prepared.id,
+        agentType: input.prepared.agentType,
+        description: input.prepared.description,
+        backend: input.backend,
+        paneId: input.paneId,
+        sessionName: input.prepared.sessionName,
+        artifactDir: input.artifactsDir,
+      },
+    };
+  }
+
+  function attachBackgroundAbort(
+    signal: AbortSignal | undefined,
+    id: string,
+    task: BackgroundTask,
+    entry: RegistryEntry,
+    taskPiDir: string,
+  ): void {
+    if (!signal) return;
+    signal.addEventListener(
+      "abort",
+      () => {
+        if (!backgroundTasks.delete(id)) return;
+        finalizeTaskPane(task, "cancelled");
+        clearTaskWidgetIfIdle();
+        const remaining = readRegistry(taskPiDir).filter((e) => e.id !== id);
+        writeRegistry(taskPiDir, remaining);
+        upsertTaskSessionHistory(taskPiDir, {
+          ...entry,
+          status: "cancelled",
+          completedAt: Date.now(),
+          background: true,
+        });
+        if (backgroundTasks.size === 0) {
+          stopWidget();
+          if (widgetCtx) {
+            widgetCtx.ui.setWidget("task", undefined);
+            widgetCtx = null;
+          }
+        }
+      },
+      { once: true },
+    );
+  }
+
+  function startSdkBackgroundTask(
+    prepared: PreparedBatchTask,
+    registered: { task: BackgroundTask },
+    taskPiDir: string,
+  ): void {
+    void prepared
+      .runSdk()
+      .then(async ({ output }) => {
+        if (!backgroundTasks.delete(prepared.id)) return;
+        const finalOutput =
+          output || "SDK subagent completed without assistant text.";
+        clearTaskWidgetIfIdle();
+        completeTask(
+          pi,
+          prepared.id,
+          registered.task,
+          finalOutput,
+          "done",
+          taskPiDir,
+        );
+      })
+      .catch((error) => {
+        if (!backgroundTasks.delete(prepared.id)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        clearTaskWidgetIfIdle();
+        completeTask(
+          pi,
+          prepared.id,
+          registered.task,
+          `Task ${prepared.id} failed: ${message}`,
+          "failed",
+          taskPiDir,
+        );
+      });
+  }
 
   // ── Tool Registration ──────────────────────────────────────────────────
 
@@ -1655,6 +1939,366 @@ export default function (pi: ExtensionAPI) {
       }
 
       return new Text(line, 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "task_batch",
+    label: "Task Batch",
+    description: TASK_BATCH_TOOL_DESCRIPTION,
+    promptSnippet: "Launch multiple independent specialist agents in background",
+    promptGuidelines: [
+      "Use for independent tasks that can run concurrently",
+      "Provide complete context in every prompt because each agent starts fresh",
+      "Do not use for task resume, durable conversations, or foreground execution",
+      "Do not poll or duplicate delegated work while the batch runs",
+      "Review completion results before reporting final conclusions",
+    ],
+    parameters: Type.Object({
+      tasks: Type.Array(
+        Type.Object({
+          agent_type: Type.String({
+            description: "The type of specialist agent to use for this task",
+          }),
+          prompt: Type.String({
+            description:
+              "The complete task for the agent to perform. Be detailed and self-contained.",
+          }),
+          description: Type.String({
+            description: "A short (3-5 word) summary of this task",
+          }),
+        }),
+        {
+          description: `Batch items to launch. Must contain ${TASK_BATCH_MIN_TASKS}-${TASK_BATCH_MAX_TASKS} tasks.`,
+          minItems: TASK_BATCH_MIN_TASKS,
+          maxItems: TASK_BATCH_MAX_TASKS,
+        },
+      ),
+      backend: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("auto"),
+            Type.Literal("herdr"),
+            Type.Literal("tmux"),
+            Type.Literal("sdk"),
+          ],
+          {
+            description:
+              "Execution backend. auto prefers herdr inside Herdr, then tmux, then SDK.",
+            default: "auto",
+          },
+        ),
+      ),
+      tab_label: Type.Optional(
+        Type.String({
+          description:
+            "Optional Herdr tab label for this batch. Ignored by tmux and SDK.",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const validation = validateTaskBatchTasks(params.tasks);
+      if (!validation.ok) {
+        return {
+          content: [{ type: "text" as const, text: validation.error }],
+          details: {
+            phase: "failed" as const,
+            error: validation.error,
+          },
+          isError: true,
+        };
+      }
+
+      const { agents, piDir: discoveredPiDir } = discoverAgents(
+        ctx.cwd,
+        BUNDLED_AGENT_DIR,
+      );
+      const agentsByName = new Map(agents.map((agent) => [agent.name, agent]));
+      const missingAgents = validation.tasks.filter(
+        (task) => !agentsByName.has(task.agent_type),
+      );
+      if (missingAgents.length > 0) {
+        const list = formatAgentList(agents);
+        const missing = missingAgents
+          .map((task) => `"${task.agent_type}"`)
+          .join(", ");
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Unknown agent(s): ${missing}.\nAvailable agents:\n${list}`,
+            },
+          ],
+          details: {
+            phase: "failed" as const,
+            error: `Unknown agent(s): ${missing}`,
+          },
+          isError: true,
+        };
+      }
+
+      let backendSelection;
+      try {
+        backendSelection = selectSubagentBackend(
+          params.backend ?? "auto",
+          paneBackends,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: message }],
+          details: {
+            phase: "failed" as const,
+            error: message,
+          },
+          isError: true,
+        };
+      }
+
+      const batchId = `batch-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
+      const batchLabel =
+        typeof params.tab_label === "string" && params.tab_label.trim()
+          ? params.tab_label.trim()
+          : undefined;
+      const artifactsDir = join(discoveredPiDir, "artifacts");
+      const sessionDir = join(artifactsDir, "sessions");
+      await mkdir(sessionDir, { recursive: true });
+      const parentToolNames = pi
+        .getAllTools()
+        .map((tool) => tool.name)
+        .filter(Boolean);
+
+      const prepared = await Promise.all(
+        validation.tasks.map((task) =>
+          prepareBatchTask({
+            agent: agentsByName.get(task.agent_type) as AgentConfig,
+            prompt: task.prompt,
+            description: task.description,
+            cwd: ctx.cwd,
+            artifactsDir,
+            sessionDir,
+            parentToolNames,
+            ctx,
+          }),
+        ),
+      );
+
+      const launched: TaskBatchStartedTask[] = [];
+      const errors: Array<{
+        index: number;
+        task_id: string;
+        agent_type: string;
+        description: string;
+        error: string;
+      }> = [];
+
+      const registerLaunched = (
+        task: PreparedBatchTask,
+        index: number,
+        paneId: string | undefined,
+        originalPane: string | null,
+      ) => {
+        const registered = registerBackgroundBatchTask({
+          prepared: task,
+          backend: backendSelection.name,
+          paneId,
+          originalPane,
+          piDir: discoveredPiDir,
+          artifactsDir,
+          batchId,
+          batchLabel,
+          batchIndex: index,
+          batchSize: prepared.length,
+        });
+        attachBackgroundAbort(
+          signal,
+          task.id,
+          registered.task,
+          registered.entry,
+          discoveredPiDir,
+        );
+        launched.push(registered.started);
+        return registered;
+      };
+
+      if (backendSelection.name === "sdk") {
+        for (const [index, task] of prepared.entries()) {
+          const registered = registerLaunched(task, index, undefined, null);
+          startSdkBackgroundTask(task, registered, discoveredPiDir);
+        }
+      } else {
+        const paneBackend = backendSelection.paneBackend;
+        if (!paneBackend) {
+          throw new Error(`Missing pane backend for ${backendSelection.name}.`);
+        }
+
+        if (backendSelection.name === "herdr" && paneBackend.spawnBatch) {
+          let result;
+          try {
+            result = paneBackend.spawnBatch({
+              cwd: ctx.cwd,
+              tabLabel: batchLabel,
+              tasks: prepared.map((task) => ({
+                command: task.shellCommand,
+                description: task.description,
+                agentType: task.agentType,
+              })),
+            });
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Failed to create ${backendSelection.name} batch panes: ${message}`,
+                },
+              ],
+              details: {
+                phase: "failed" as const,
+                batch_id: batchId,
+                backend: backendSelection.name,
+                error: message,
+              },
+              isError: true,
+            };
+          }
+
+          result.items.forEach((item, index) => {
+            const task = prepared[index]!;
+            if (item.paneId) {
+              registerLaunched(task, index, item.paneId, item.originalPane);
+              return;
+            }
+            errors.push({
+              index,
+              task_id: task.id,
+              agent_type: task.agentType,
+              description: task.description,
+              error: item.error?.message ?? "Herdr batch did not launch task.",
+            });
+          });
+        } else {
+          for (const [index, task] of prepared.entries()) {
+            try {
+              const pane = paneBackend.spawn({
+                cwd: ctx.cwd,
+                command: task.shellCommand,
+                description: task.description,
+                agentType: task.agentType,
+              });
+              registerLaunched(task, index, pane.paneId, pane.originalPane);
+            } catch (error) {
+              paneBackend.rollbackSpawn();
+              const message =
+                error instanceof Error ? error.message : String(error);
+              errors.push({
+                index,
+                task_id: task.id,
+                agent_type: task.agentType,
+                description: task.description,
+                error: message,
+              });
+            }
+          }
+        }
+      }
+
+      if (launched.length > 0) ensureTaskWidget(ctx);
+
+      const errorLines =
+        errors.length > 0
+          ? [
+              "",
+              "Launch errors:",
+              ...errors.map(
+                (error) =>
+                  `${error.index + 1}. ${error.task_id} (${error.agent_type}) - ${error.error}`,
+              ),
+            ]
+          : [];
+      const receipt = [
+        `Batch: ${batchId}.`,
+        `Backend: ${backendSelection.name}.`,
+        formatTaskBatchReceipt(launched),
+        ...errorLines,
+      ].join("\n");
+      const details = {
+        ...formatTaskBatchDetails(launched),
+        batch_id: batchId,
+        batch_label: batchLabel,
+        backend: backendSelection.name,
+        requested_count: prepared.length,
+        launched_count: launched.length,
+        task_ids: launched.map((task) => task.taskId),
+        session_names: launched.map((task) => task.sessionName),
+        pane_ids: launched
+          .map((task) => task.paneId)
+          .filter((paneId): paneId is string => Boolean(paneId)),
+        errors,
+      };
+
+      if (launched.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                errors.length > 0
+                  ? receipt
+                  : `No task_batch items launched for ${batchId}.`,
+            },
+          ],
+          details: {
+            ...details,
+            phase: "failed" as const,
+            error: "No batch tasks launched",
+          },
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: receipt }],
+        details,
+      };
+    },
+
+    renderCall(args, theme, _context) {
+      const count = Array.isArray((args as Record<string, unknown>).tasks)
+        ? ((args as Record<string, unknown>).tasks as unknown[]).length
+        : 0;
+      const text =
+        theme.fg("toolTitle", "") +
+        theme.fg("accent", "batch") +
+        theme.fg("dim", count > 0 ? ` - ${count} tasks` : "");
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, _options, theme, _context) {
+      const d = result.details as
+        | {
+            batch_id?: string;
+            launched_count?: number;
+            requested_count?: number;
+            backend?: string;
+            errors?: unknown[];
+          }
+        | undefined;
+      if (!d) return new Text("", 0, 0);
+      const launched = d.launched_count ?? 0;
+      const requested = d.requested_count ?? launched;
+      const hasErrors = Array.isArray(d.errors) && d.errors.length > 0;
+      const icon = hasErrors ? theme.fg("error", "x") : theme.fg("success", "✓");
+      return new Text(
+        `${icon} ${theme.fg("accent", d.batch_id ?? "task_batch")} ${theme.fg(
+          "dim",
+          `${launched}/${requested} launched${d.backend ? ` via ${d.backend}` : ""}`,
+        )}`,
+        0,
+        0,
+      );
     },
   });
 
