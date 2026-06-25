@@ -7,6 +7,7 @@ import { buildTmuxSplitWindowArgs, chooseTmuxSplitDirection } from "../helpers.j
 import type {
   SpawnSubagentOptions,
   SpawnedSubagentPane,
+  SubagentOutcome,
   SubagentPaneBackend,
 } from "./backend.js";
 
@@ -57,7 +58,11 @@ export class TmuxBackend implements SubagentPaneBackend {
     return { paneId, originalPane };
   }
 
-  kill(paneId?: string, originalPane?: string | null): void {
+  finalize(
+    paneId: string | undefined,
+    originalPane: string | null | undefined,
+    _outcome: SubagentOutcome,
+  ): void {
     if (paneId) {
       try {
         this.command(["kill-pane", "-t", paneId]);
@@ -72,6 +77,19 @@ export class TmuxBackend implements SubagentPaneBackend {
         // Original pane may no longer exist.
       }
     }
+  }
+
+  rollbackSpawn(paneId?: string): void {
+    if (!paneId) return;
+    try {
+      this.command(["kill-pane", "-t", paneId]);
+    } catch {
+      // Pane already exited.
+    }
+  }
+
+  kill(paneId?: string, originalPane?: string | null): void {
+    this.finalize(paneId, originalPane, "cancelled");
   }
 
   steer(paneId: string, message: string): void {

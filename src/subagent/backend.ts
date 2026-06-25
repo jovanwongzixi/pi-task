@@ -1,11 +1,18 @@
 export type PaneBackendName = "tmux" | "herdr";
 export type SubagentBackendName = PaneBackendName | "sdk";
 export type SubagentBackendPreference = SubagentBackendName | "auto";
+export type SubagentOutcome =
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "cancelled"
+  | "tracking-error";
 
 export interface SpawnSubagentOptions {
   cwd: string;
   command: string;
   description?: string;
+  agentType?: string;
 }
 
 export interface SpawnedSubagentPane {
@@ -19,8 +26,20 @@ export interface SubagentPaneBackend {
   available(): boolean;
   spawn(options: SpawnSubagentOptions): SpawnedSubagentPane;
   exists(paneId: string): boolean;
+  finalize(
+    paneId: string | undefined,
+    originalPane: string | null | undefined,
+    outcome: SubagentOutcome,
+  ): void;
+  rollbackSpawn(paneId?: string): void;
   kill(paneId?: string, originalPane?: string | null): void;
   steer(paneId: string, message: string): void;
+  /**
+   * Reconstruct transient backend launch state after restoring active registry
+   * entries. Backends should infer current tab/workspace from live pane state
+   * and must not move panes.
+   */
+  adoptRestoredPanes?(entries: { paneId: string; startedAt: number }[]): void;
 }
 
 export interface BackendSelection {
