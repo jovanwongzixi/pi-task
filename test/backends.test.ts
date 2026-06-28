@@ -1263,9 +1263,20 @@ test("Herdr availability requires HERDR_ENV and a successful pane list", () => {
   }
 });
 
-test("Tmux finalize preserves cleanup behavior for every outcome", () => {
+test("Tmux finalize lets completed panes self-clean and kills abnormal outcomes", () => {
+  {
+    const calls: string[][] = [];
+    const backend = tmuxBackend((args) => {
+      calls.push(args);
+      return "";
+    });
+
+    backend.finalize("%child", "%parent", "completed");
+
+    assert.deepEqual(calls, [["select-pane", "-t", "%parent"]]);
+  }
+
   for (const outcome of [
-    "completed",
     "failed",
     "timeout",
     "cancelled",
@@ -1280,8 +1291,8 @@ test("Tmux finalize preserves cleanup behavior for every outcome", () => {
     backend.finalize("%child", "%parent", outcome);
 
     assert.deepEqual(calls, [
-      ["kill-pane", "-t", "%child"],
       ["select-pane", "-t", "%parent"],
+      ["kill-pane", "-t", "%child"],
     ]);
   }
 });

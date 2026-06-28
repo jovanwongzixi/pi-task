@@ -1,10 +1,14 @@
-# pi-task
+# @heyhuynhgiabuu/pi-task
 
 Delegating task/subagent extension for [Pi](https://pi.dev). It adds a `task` tool that can run specialized subagents in foreground or background, show task progress in the TUI, and deliver background completion back to the parent assistant.
 
 ## Demo
 
-![pi-task TUI demo](./media/demo.png)
+![pi-task background task demo](./media/demo-background-task.webp)
+
+_Auto-playing preview of the 89s walkthrough (1 fps): spawning a background subagent in a tmux pane, watching the live tool-call progress in the parent pane, and reading the final result via the session JSONL._
+
+For the full high-quality 89s @ 56 fps version, [download the MP4](https://github.com/heyhuynhgiabuu/pi-task/releases/download/v0.2.0/demo-background-task.mp4).
 
 ## Features
 

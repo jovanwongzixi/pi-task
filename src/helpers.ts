@@ -80,16 +80,11 @@ export const TASK_BACKGROUND_DEFAULT = true;
 export const TASK_BATCH_MIN_TASKS = 1;
 export const TASK_BATCH_MAX_TASKS = 12;
 
-export const TASK_RESULT_XML_INSTRUCTIONS = `<status>success|failure|blocked|partial</status>
-<summary>One sentence: what was accomplished</summary>
-<findings>Key findings with file:line references</findings>
-<evidence>Verification evidence, commands run, output snippets</evidence>
-<confidence>high|medium|low (optional — how certain the findings are)</confidence>
-<files>Comma-separated absolute paths of files read/created (optional)</files>
+export const TASK_PROMPT_INSTRUCTIONS = `Your final assistant message IS the result the parent agent will read.
 
-Prefer writing this block to RESULT.md when done. If you cannot write the file, your final assistant message MUST include the same XML block.`;
+When you are done, end your final assistant message with a clear, self-contained summary in plain text. Do not wrap it in XML tags. Do not write a RESULT.md file — the parent agent reads your final assistant message from the session JSONL, not from any file.`;
 
-export const OUTPUT_FORMAT_GUIDE = TASK_RESULT_XML_INSTRUCTIONS;
+export const OUTPUT_FORMAT_GUIDE = TASK_PROMPT_INSTRUCTIONS;
 
 export const TASK_TOOL_DESCRIPTION = `Launch a new agent to handle complex, multistep tasks autonomously.
 
@@ -163,7 +158,7 @@ export function parseResultXml(raw: string): ParsedResult {
   ) {
     return {
       status: "unknown",
-      summary: raw.slice(0, 500),
+      summary: raw.trim(),
       findings: "",
       evidence: "",
       confidence: "",
@@ -269,8 +264,6 @@ export interface TaskBatchRequestItem {
   agent_type: string;
   prompt: string;
   description: string;
-  backend?: TaskBatchRequestedBackendName;
-  conversation_id?: string;
 }
 
 export type TaskBatchSizeValidationResult =
@@ -300,8 +293,8 @@ export interface TaskBatchStartedTask {
   backend: TaskBackendName;
   paneId?: string;
   sessionName: string;
+  sessionDir: string;
   artifactDir: string;
-  conversationId?: string;
 }
 
 export interface TaskBatchTaskDetails {
@@ -311,8 +304,8 @@ export interface TaskBatchTaskDetails {
   backend: TaskBackendName;
   pane_id?: string;
   session_name: string;
+  session_dir: string;
   artifact_dir: string;
-  conversation_id?: string;
   background: true;
 }
 
@@ -384,13 +377,6 @@ export function validateTaskBatchTasks(
   if (!size.ok) return size;
 
   const normalized: TaskBatchRequestItem[] = [];
-  const validBackends = new Set<TaskBatchRequestedBackendName>([
-    "auto",
-    "herdr",
-    "tmux",
-    "sdk",
-  ]);
-
   for (let index = 0; index < tasks.length; index++) {
     const task = tasks[index];
     const label = `task ${index + 1}`;
@@ -432,30 +418,25 @@ export function validateTaskBatchTasks(
       };
     }
 
-    if (
-      task.backend !== undefined &&
-      (!nonEmptyString(task.backend) ||
-        !validBackends.has(task.backend as TaskBatchRequestedBackendName))
-    ) {
+    if (task.backend !== undefined) {
       return {
         ok: false,
         count: tasks.length,
         minTasks: TASK_BATCH_MIN_TASKS,
         maxTasks: TASK_BATCH_MAX_TASKS,
-        error: `${label} backend must be auto, herdr, tmux, or sdk.`,
+        error:
+          `${label} must not include backend. Set task_batch backend at the top level.`,
       };
     }
 
-    if (
-      task.conversation_id !== undefined &&
-      !nonEmptyString(task.conversation_id)
-    ) {
+    if (task.conversation_id !== undefined || task.task_id !== undefined) {
       return {
         ok: false,
         count: tasks.length,
         minTasks: TASK_BATCH_MIN_TASKS,
         maxTasks: TASK_BATCH_MAX_TASKS,
-        error: `${label} conversation_id must be a non-empty string when provided.`,
+        error:
+          `${label} must not include task_id or conversation_id. task_batch always starts new background tasks.`,
       };
     }
 
@@ -463,11 +444,6 @@ export function validateTaskBatchTasks(
       agent_type: task.agent_type.trim(),
       prompt: task.prompt.trim(),
       description: task.description.trim(),
-      backend: task.backend as TaskBatchRequestedBackendName | undefined,
-      conversation_id:
-        typeof task.conversation_id === "string"
-          ? task.conversation_id.trim()
-          : undefined,
     });
   }
 
@@ -490,6 +466,7 @@ export function formatTaskBatchReceipt(
       `   Backend: ${task.backend}.`,
       ...(task.paneId ? [`   Pane: ${task.paneId}.`] : []),
       `   Session: ${task.sessionName}.`,
+      `   Session directory: ${task.sessionDir}.`,
       `   Artifact directory: ${task.artifactDir}.`,
     );
   }
@@ -514,8 +491,8 @@ export function formatTaskBatchDetails(
       backend: task.backend,
       pane_id: task.paneId,
       session_name: task.sessionName,
+      session_dir: task.sessionDir,
       artifact_dir: task.artifactDir,
-      conversation_id: task.conversationId,
       background: true,
     })),
   };

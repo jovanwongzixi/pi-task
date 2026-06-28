@@ -1,22 +1,22 @@
 /**
  * Task Tool — Delegate complex work to specialist agents.
  *
- * Spawns Pi CLI in a Herdr or tmux split pane (so you can watch it live) and
- * detects completion via RESULT.md polling. On completion, tool call
- * count and duration are reported as a notification.
+ * Spawns pi CLI in a tmux split pane (foreground) or background.
+ * Completion is detected from the subagent's final assistant message
+ * in the persistent session JSONL (stopReason gating). The final message
+ * is the authoritative result; no RESULT.md is used.
  *
  * Three agent sources:
  *   - .pi/agents/*.md        project-local agents
  *   - ~/.pi/agent/agents/*.md user-global agents (fallback)
  *
  * P0: Persistent task registry (appendEntry + JSON), --session resume,
- *     sendMessage completion notification.
- * P1: Foreground mode (background:false, inline subprocess), pane death
- *     detection, 30-minute timeout.
+ *     sendMessage completion notification, Ctrl+O expand/collapse.
+ * P1: Foreground mode (background:false), pane death detection, timeout.
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,60 +24,79 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { Text, truncateToWidth } from "@earendil-works/pi-tui";
+
 import { buildAgentToolSelection } from "./agent-tools.js";
 import {
+  BACKGROUND_CHECK_MS,
+  COUNT_POLL_MS,
+  MAX_POLL_ERRORS,
+  TASK_TIMEOUT_MS,
+} from "./constants.js";
+import {
+  findJsonlSessionByName,
   normalizeConversationId,
   parseMetadataFromBody,
   readTaskBlock,
+  findTaskSessionHistory,
+  readRegistry,
   readTaskSessionsRegistry,
   renderConversationSessions,
+  upsertTaskSessionHistory,
   writeConversationArtifacts,
+  writeRegistry,
   writeTaskSessionsRegistry,
 } from "./conversation.js";
 import {
-  type ToolCallRecord,
-  TASK_BACKGROUND_DEFAULT,
-  TASK_BATCH_MAX_TASKS,
-  TASK_BATCH_MIN_TASKS,
   TASK_BATCH_TOOL_DESCRIPTION,
-  TASK_RESULT_XML_INSTRUCTIONS,
+  TASK_BACKGROUND_DEFAULT,
   TASK_TOOL_DESCRIPTION,
+  buildPiArgs,
+  countToolUses,
+  discoverAgents,
+  formatAgentList,
   formatBackgroundReceipt,
   formatTaskBatchDetails,
   formatTaskBatchReceipt,
-  buildPiArgs,
   parseResultXml,
-  formatMs,
   shellQuote,
-  discoverAgents,
-  formatAgentList,
-  countToolUses,
-  readRecentToolCalls,
   validateTaskBatchTasks,
   type AgentConfig,
   type TaskBatchStartedTask,
 } from "./helpers.js";
+import {
+  completeTask,
+  createTaskWidgetController,
+  restoreActiveBackgroundTasks,
+  startBackgroundPolling,
+  startToolStatsPolling,
+} from "./lifecycle/index.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import {
-  type SubagentBackendName,
-  type SubagentOutcome,
-  type SubagentPaneBackend,
   selectSubagentBackend,
+  type SubagentBackendName,
+  type SubagentPaneBackend,
 } from "./subagent/backend.js";
 import { HerdrBackend } from "./subagent/herdr.js";
-import { TmuxBackend } from "./subagent/tmux.js";
 import {
-  type TaskCompletionSnapshot,
   checkTaskCompletion,
   waitForTaskCompletion as waitForSessionTaskCompletion,
 } from "./subagent/waitCompletion.js";
 import {
-  renderTaskWidget,
-  TASK_WIDGET_RENDER_MS,
-  type ThemeLike,
-} from "./task-widget.js";
+  TmuxBackend,
+  wrapWithPaneExitWatcher,
+} from "./subagent/tmux.js";
+import {
+  buildTaskPrompt,
+  createTaskCompleteRenderer,
+  renderCall,
+  renderResult,
+  taskBatchParametersSchema,
+  taskParametersSchema,
+} from "./tool/index.js";
+import type {
+  BackgroundTask,
+  RegistryEntry,
+} from "./types.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -86,335 +105,13 @@ const BUNDLED_AGENT_DIR = join(
   "..",
   "agents",
 );
-const BACKGROUND_CHECK_MS = 10_000; // poll every 10 sec
-const COUNT_POLL_MS = 3_000; // update toolcall counts every 3 sec
-const TASK_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
-const MAX_POLL_ERRORS = 3; // consecutive poll failures before giving up on a task
-const tmuxBackend = new TmuxBackend();
 const herdrBackend = new HerdrBackend();
+const tmuxBackend = new TmuxBackend();
 const paneBackends: readonly SubagentPaneBackend[] = [
   herdrBackend,
   tmuxBackend,
 ];
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface BackgroundTask {
-  backend: SubagentBackendName;
-  dir: string;
-  agentType: string;
-  sessionName: string;
-  paneId?: string;
-  originalPane: string | null;
-  description: string;
-  startedAt: number;
-  toolUses: number;
-  turns: number;
-  conversationId?: string;
-  batchId?: string;
-  batchLabel?: string;
-  batchIndex?: number;
-  batchSize?: number;
-  /** Most recent tool calls (capped), updated every COUNT_POLL_MS. */
-  recentCalls: ToolCallRecord[];
-  /** Consecutive completion-poll failures; reset to 0 on a successful poll. */
-  pollErrors?: number;
-  /** Guards backend lifecycle hooks against races between polling and aborts. */
-  finalized?: boolean;
-}
-
-/** Serializable subset for active task registry persistence. */
-interface RegistryEntry {
-  id: string;
-  agentType: string;
-  description: string;
-  sessionName: string;
-  startedAt: number;
-  paneId?: string;
-  piDir: string;
-  dir: string;
-  conversationId?: string;
-  sessionRef?: string;
-  backend?: SubagentBackendName;
-  batchId?: string;
-  batchLabel?: string;
-  batchIndex?: number;
-  batchSize?: number;
-}
-
-/** Durable task→session mapping used for resume after task completion. */
-interface TaskSessionHistoryEntry extends RegistryEntry {
-  status: "running" | "done" | "cancelled" | "aborted" | "failed" | "timeout";
-  completedAt?: number;
-  background: boolean;
-}
-
-export /** Details attached to tool result for rendering. */
-interface TaskDetails {
-  task_id: string;
-  agent_type: string;
-  description: string;
-  conversation_id?: string;
-  phase: "done" | "timeout" | "cancelled" | "aborted" | "failed";
-  // Completed phase
-  status?: string;
-  summary?: string;
-  findings?: string;
-  evidence?: string;
-  confidence?: string;
-  duration_ms?: number;
-  turn_count?: number;
-  tool_uses?: number;
-  // Background
-  background?: boolean;
-  backend?: SubagentBackendName;
-  pane_id?: string;
-  session_name?: string;
-  batch_id?: string;
-  batch_label?: string;
-  batch_index?: number;
-  batch_size?: number;
-  /** @deprecated Retained when reading older tool results. */
-  tmux_session?: string;
-}
-
 // Conversation helpers live in ./conversation.js.
-
-function readRegistry(piDir: string): RegistryEntry[] {
-  const path = join(piDir, "task-registry.json");
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function writeRegistry(piDir: string, entries: RegistryEntry[]): void {
-  const path = join(piDir, "task-registry.json");
-  writeFileSync(path, JSON.stringify(entries, null, 2), "utf-8");
-}
-
-function readTaskSessionHistory(piDir: string): TaskSessionHistoryEntry[] {
-  const path = join(piDir, "task-session-history.json");
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function writeTaskSessionHistory(
-  piDir: string,
-  entries: TaskSessionHistoryEntry[],
-): void {
-  const path = join(piDir, "task-session-history.json");
-  writeFileSync(path, JSON.stringify(entries, null, 2), "utf-8");
-}
-
-function upsertTaskSessionHistory(
-  piDir: string,
-  entry: TaskSessionHistoryEntry,
-): void {
-  const entries = readTaskSessionHistory(piDir);
-  const index = entries.findIndex((existing) => existing.id === entry.id);
-  if (index >= 0) {
-    entries[index] = { ...entries[index], ...entry };
-  } else {
-    entries.push(entry);
-  }
-  writeTaskSessionHistory(piDir, entries);
-}
-
-function findTaskSessionHistory(
-  piDir: string,
-  idOrSessionName: string,
-): TaskSessionHistoryEntry | undefined {
-  return readTaskSessionHistory(piDir).find(
-    (entry) =>
-      entry.id === idOrSessionName || entry.sessionName === idOrSessionName,
-  );
-}
-
-function findJsonlSessionByName(
-  piDir: string,
-  sessionName: string,
-  agentType: string,
-): TaskSessionHistoryEntry | undefined {
-  const artifactsDir = join(piDir, "artifacts");
-  const sessionDir = join(artifactsDir, "sessions");
-  try {
-    if (!existsSync(sessionDir)) return undefined;
-    const files = readdirSync(sessionDir)
-      .filter((file) => file.endsWith(".jsonl"))
-      .sort()
-      .reverse();
-    for (const file of files) {
-      const content = readFileSync(join(sessionDir, file), "utf-8");
-      let startedAt = Date.now();
-      for (const rawLine of content.split("\n")) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        try {
-          const entry = JSON.parse(line) as {
-            type?: string;
-            timestamp?: string;
-            name?: string;
-            session_info?: { name?: string };
-          };
-          if (entry.type === "session" && entry.timestamp) {
-            const parsed = Date.parse(entry.timestamp);
-            if (Number.isFinite(parsed)) startedAt = parsed;
-          }
-          if (entry.type === "session_info") {
-            const name = entry.name ?? entry.session_info?.name;
-            if (name === sessionName) {
-              return {
-                id: sessionName,
-                agentType,
-                description: `Resumed session ${sessionName}`,
-                sessionName,
-                sessionRef: join(sessionDir, file),
-                startedAt,
-                piDir,
-                dir: artifactsDir,
-                status: "done",
-                background: false,
-              };
-            }
-            break;
-          }
-        } catch {
-          // Skip malformed lines
-        }
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
-
-function getPaneBackend(
-  backend: SubagentBackendName | undefined,
-): SubagentPaneBackend | undefined {
-  if (backend === "herdr") return herdrBackend;
-  if (backend === "tmux" || backend === undefined) return tmuxBackend;
-  return undefined;
-}
-
-function registryPaneIsAlive(entry: RegistryEntry): boolean {
-  if (!entry.paneId) return false;
-  return getPaneBackend(entry.backend)?.exists(entry.paneId) ?? false;
-}
-
-type TaskTerminalPhase = "done" | "timeout" | "cancelled" | "failed";
-
-function outcomeForPhase(phase: TaskTerminalPhase): SubagentOutcome {
-  switch (phase) {
-    case "done":
-      return "completed";
-    case "timeout":
-      return "timeout";
-    case "cancelled":
-      return "cancelled";
-    case "failed":
-      return "failed";
-  }
-}
-
-function finalizeTaskPane(
-  task: BackgroundTask,
-  outcome: SubagentOutcome,
-): void {
-  if (task.backend === "sdk" || task.finalized) return;
-  task.finalized = true;
-  getPaneBackend(task.backend)?.finalize(
-    task.paneId,
-    task.originalPane,
-    outcome,
-  );
-}
-
-// ─── Process a completed task (sendMessage + registry cleanup) ──────────────
-
-function completeTask(
-  pi: ExtensionAPI,
-  id: string,
-  task: BackgroundTask,
-  content: string,
-  phase: TaskTerminalPhase,
-  piDir: string,
-  outcome: SubagentOutcome = outcomeForPhase(phase),
-): void {
-  finalizeTaskPane(task, outcome);
-
-  const parsed = parseResultXml(content);
-  const durationMs = Date.now() - task.startedAt;
-  const completedSessionRef = findJsonlSessionByName(
-    piDir,
-    task.sessionName,
-    task.agentType,
-  )?.sessionRef;
-
-  upsertTaskSessionHistory(piDir, {
-    id,
-    agentType: task.agentType,
-    description: task.description,
-    sessionName: task.sessionName,
-    backend: task.backend,
-    startedAt: task.startedAt,
-    paneId: task.paneId,
-    piDir,
-    dir: task.dir,
-    conversationId: task.conversationId,
-    sessionRef: completedSessionRef,
-    batchId: task.batchId,
-    batchLabel: task.batchLabel,
-    batchIndex: task.batchIndex,
-    batchSize: task.batchSize,
-    status: phase,
-    completedAt: Date.now(),
-    background: true,
-  });
-
-  // Send completion notification
-  pi.sendMessage(
-    {
-      customType: "task-complete",
-      content: `Background task ${id} (${task.agentType}) ${phase}.\n\nResult:\n${content}`,
-      display: true,
-      details: {
-        task_id: id,
-        agent_type: task.agentType,
-        description: task.description,
-        phase,
-        status: phase,
-        result: content,
-        summary: parsed.summary,
-        findings: parsed.findings,
-        confidence: parsed.confidence,
-        backend: task.backend,
-        pane_id: task.paneId,
-        session_name: task.sessionName,
-        batch_id: task.batchId,
-        batch_label: task.batchLabel,
-        batch_index: task.batchIndex,
-        batch_size: task.batchSize,
-        duration_ms: durationMs,
-        tool_uses: task.toolUses,
-        turn_count: task.turns,
-      },
-    },
-    {
-      triggerTurn: true,
-      deliverAs: "followUp",
-    },
-  );
-
-  // Remove from registry
-  const entries = readRegistry(piDir).filter((e) => e.id !== id);
-  writeRegistry(piDir, entries);
-}
 
 // ─── Extension Entry Point ──────────────────────────────────────────────────
 
@@ -423,321 +120,61 @@ export default function (pi: ExtensionAPI) {
   if (process.env.PI_TASK_TOOL_DISABLED === "1") return;
 
   // ── Background task tracker ────────────────────────────────────────────
-  const backgroundTasks = new Map<string, BackgroundTask>();
-  const foregroundTasks = new Map<string, BackgroundTask>();
-  let widgetCtx: ExtensionContext | null = null;
+      const { piDir } = discoverAgents(process.cwd(), BUNDLED_AGENT_DIR);
+      const backgroundTasks = new Map<string, BackgroundTask>();
+      const foregroundTasks = new Map<string, BackgroundTask>();
+  const taskWidget = createTaskWidgetController(foregroundTasks, backgroundTasks);
+  const { ensureTaskWidget, clearTaskWidgetIfIdle } = taskWidget;
 
   // ── Restore active tasks from registry on load ──────────────────────────
-  const { piDir } = discoverAgents(process.cwd());
-  const registry = readRegistry(piDir);
-  const staleIds: string[] = [];
-  const restoredHerdrPanes: { paneId: string; startedAt: number }[] = [];
-  for (const entry of registry) {
-    // Only restore if artifact dir still exists
-    if (!existsSync(entry.dir)) {
-      staleIds.push(entry.id);
-      continue;
-    }
 
-    const paneAlive = registryPaneIsAlive(entry);
-    if (!paneAlive) {
-      staleIds.push(entry.id);
-      continue;
-    }
+  restoreActiveBackgroundTasks(piDir, backgroundTasks, paneBackends);
 
-    const bgtask: BackgroundTask = {
-      backend: entry.backend ?? "tmux",
-      dir: entry.dir,
-      agentType: entry.agentType,
-      sessionName: entry.sessionName,
-      paneId: entry.paneId,
-      originalPane: null,
-      description: entry.description,
-      startedAt: entry.startedAt,
-      toolUses: 0,
-      turns: 0,
-      conversationId: entry.conversationId,
-      batchId: entry.batchId,
-      batchLabel: entry.batchLabel,
-      batchIndex: entry.batchIndex,
-      batchSize: entry.batchSize,
-      recentCalls: [],
-    };
-
-    backgroundTasks.set(entry.id, bgtask);
-    if (bgtask.backend === "herdr" && bgtask.paneId) {
-      restoredHerdrPanes.push({
-        paneId: bgtask.paneId,
-        startedAt: bgtask.startedAt,
-      });
-    }
-  }
-  if (restoredHerdrPanes.length > 0) {
-    getPaneBackend("herdr")?.adoptRestoredPanes?.(restoredHerdrPanes);
-  }
-  if (staleIds.length) {
-    writeRegistry(
-      piDir,
-      registry.filter((e) => !staleIds.includes(e.id)),
-    );
-  }
 
   // ── Widget / timer setup ───────────────────────────────────────────────
 
-  let widgetTimer: ReturnType<typeof setInterval> | null = null;
-  function stopWidget() {
-    if (widgetTimer) {
-      clearInterval(widgetTimer);
-      widgetTimer = null;
-    }
-  }
-
-  const countInterval = setInterval(() => {
-    for (const task of [
-      ...foregroundTasks.values(),
-      ...backgroundTasks.values(),
-    ]) {
-      const sessionDir = join(task.dir, "sessions");
-      // Single walk: counts + recent tool-call history with status
-      const { toolUses, turns, recent } = readRecentToolCalls(
-        sessionDir,
-        12,
-        task.sessionName,
-      );
-      task.toolUses = toolUses;
-      task.turns = turns;
-      task.recentCalls = recent;
-    }
-  }, COUNT_POLL_MS);
-
-  // Theme reference is captured at setWidget time so renderWidget can use it.
-  let widgetTheme: ThemeLike | null = null;
-
-  function renderWidget(width: number): string[] {
-    // Defensive: never let a render exception kill the TUI. If anything
-    // throws (theme lookup miss, malformed session JSONL, etc.), fall
-    // back to a minimal single-line summary so the TUI stays alive.
-    try {
-      return renderTaskWidget({
-        foregroundTasks: foregroundTasks.entries(),
-        backgroundTasks: backgroundTasks.entries(),
-        foregroundCount: foregroundTasks.size,
-        backgroundCount: backgroundTasks.size,
-        width,
-        theme: widgetTheme,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const active = [
-        ...Array.from(foregroundTasks.entries()),
-        ...Array.from(backgroundTasks.entries()),
-      ];
-      if (active.length === 0) return [];
-      const [, task] = active[0];
-      return [
-        truncateToWidth(
-          `${task.agentType}  \u2022 ${formatMs(Date.now() - task.startedAt)}  (render error: ${msg})`,
-          Math.min(width, 120),
-        ),
-      ];
-    }
-  }
-
-  function ensureTaskWidget(targetCtx: ExtensionContext): void {
-    if (widgetCtx || targetCtx.mode !== "tui") return;
-    widgetCtx = targetCtx;
-    targetCtx.ui.setWidget("task", (tui, theme) => {
-      widgetTheme = theme ?? null;
-      widgetTimer = setInterval(
-        () => tui.requestRender(),
-        TASK_WIDGET_RENDER_MS,
-      );
-      // Don't keep the process alive just for the widget refresh.
-      widgetTimer.unref?.();
-      return {
-        render: (width: number) => renderWidget(width),
-        invalidate: () => {},
-        dispose: () => {
-          widgetTheme = null;
-          stopWidget();
-        },
-      };
-    });
-  }
-
-  function clearTaskWidgetIfIdle(): void {
-    if (foregroundTasks.size > 0 || backgroundTasks.size > 0) return;
-    stopWidget();
-    if (widgetCtx) {
-      widgetCtx.ui.setWidget("task", undefined);
-      widgetCtx = null;
-    }
-  }
+  const countInterval = startToolStatsPolling(
+    foregroundTasks,
+    backgroundTasks,
+    COUNT_POLL_MS,
+  );
 
   // ── Polling loop (background task completion, pane death, timeout) ──────
 
-  // setInterval does not wait for an async callback to settle, so a slow pass
-  // (many tasks / slow fs) could overlap the next one and double-complete a
-  // task. This guard makes ticks that fire mid-pass no-ops.
-  let checkInFlight = false;
-
-  const checkInterval = setInterval(async () => {
-    if (checkInFlight) return;
-    if (backgroundTasks.size === 0) {
-      clearTaskWidgetIfIdle();
-      return;
-    }
-    checkInFlight = true;
-
-    try {
-      const now = Date.now();
-      const ids = Array.from(backgroundTasks.keys());
-
-      for (const id of ids) {
-        const task = backgroundTasks.get(id);
-        if (!task) continue;
-
-        // ── Check timeout ────────────────────────────────────────────
-        if (now - task.startedAt > TASK_TIMEOUT_MS) {
-          backgroundTasks.delete(id);
-          clearTaskWidgetIfIdle();
-          completeTask(
-            pi,
-            id,
-            task,
-            "Task timed out after 30 minutes",
-            "timeout",
-            piDir,
-          );
-          continue;
-        }
-
-        // SDK tasks complete through their in-process promise below. They stay
-        // in this map for widget/timeout tracking, but have no pane to poll.
-        if (task.backend === "sdk") continue;
-
-        // A transient fs error here (RESULT.md mid-write, EACCES, dir briefly
-        // missing) must NOT drop the task. Keep it tracked and retry on the
-        // next tick; only give up after repeated failures (the timeout above
-        // is the ultimate backstop).
-        let snapshot: TaskCompletionSnapshot;
-        try {
-          snapshot = await checkTaskCompletion({
-            resultPath: join(task.dir, "RESULT.md"),
-            sessionDir: join(task.dir, "sessions"),
-            sessionName: task.sessionName,
-            paneId: task.paneId,
-            paneExists: (candidatePaneId) =>
-              getPaneBackend(task.backend)?.exists(candidatePaneId) ?? false,
-            sinceMs: task.startedAt,
-          });
-        } catch (err) {
-          task.pollErrors = (task.pollErrors ?? 0) + 1;
-          if (task.pollErrors >= MAX_POLL_ERRORS) {
-            backgroundTasks.delete(id);
-            clearTaskWidgetIfIdle();
-            const message = err instanceof Error ? err.message : String(err);
-            completeTask(
-              pi,
-              id,
-              task,
-              `Task ${id} polling failed ${task.pollErrors}x; last error: ${message}`,
-              "failed",
-              piDir,
-              "tracking-error",
-            );
-          }
-          // Otherwise leave the task tracked and retry next tick.
-          continue;
-        }
-
-        // Successful poll clears the error streak.
-        task.pollErrors = 0;
-
-        if (snapshot.status === "running") {
-          continue;
-        }
-
-        const phase = snapshot.status === "completed" ? "done" : "failed";
-        backgroundTasks.delete(id);
-        clearTaskWidgetIfIdle();
-        completeTask(pi, id, task, snapshot.content, phase, piDir);
-      }
-    } finally {
-      checkInFlight = false;
-    }
-  }, BACKGROUND_CHECK_MS);
+  const checkInterval = startBackgroundPolling(
+    {
+      backgroundTasks,
+      checkTaskCompletion,
+      paneBackends,
+      clearTaskWidgetIfIdle,
+      completeTask,
+      TASK_TIMEOUT_MS,
+      MAX_POLL_ERRORS,
+      piDir,
+      pi,
+    },
+    BACKGROUND_CHECK_MS,
+  );
 
   // ── Cleanup on shutdown ────────────────────────────────────────────────
 
   pi.on("session_shutdown", () => {
     clearInterval(checkInterval);
     clearInterval(countInterval);
-    stopWidget();
-    if (widgetCtx) {
-      widgetCtx.ui.setWidget("task", undefined);
-      widgetCtx = null;
-    }
+    taskWidget.dispose();
   });
 
-  // ── Custom notification renderer ───────────────────────────────────────
-
-  pi.registerMessageRenderer?.(
-    "task-complete",
-    (message, { expanded }, theme) => {
-      const d = message.details as Record<string, unknown> | undefined;
-      if (!d) return undefined;
-
-      const agentType = (d.agent_type as string) || "";
-      const desc = (d.description as string) || "";
-      const summary = (d.summary as string) || "";
-      const findings = (d.findings as string) || "";
-      const confidence = (d.confidence as string) || "";
-      const durationMs = (d.duration_ms as number) || 0;
-      const toolUses = (d.tool_uses as number) || 0;
-
-      let line = " " + theme.fg("accent", agentType);
-      if (desc) line += theme.fg("dim", ` - ${desc}`);
-
-      const useStr = toolUses > 0 ? `${toolUses} toolcalls` : "";
-      const durStr = durationMs >= 1000 ? formatMs(durationMs) : "";
-      const statsParts = [useStr, durStr].filter(Boolean);
-      const statsText = statsParts.join(" • ");
-      const confStr = confidence ? confidence.toUpperCase() : "";
-      const confColor =
-        confidence === "high"
-          ? "success"
-          : confidence === "low"
-            ? "error"
-            : "accent";
-
-      if (statsText || confStr) {
-        line += "\n ";
-        if (confStr) line += theme.fg(confColor as any, `[${confStr}]`);
-        if (statsText)
-          line += (confStr ? " " : "") + theme.fg("dim", statsText);
-      }
-
-      if (expanded) {
-        if (summary) line += "\n " + theme.fg("muted", summary);
-        if (findings) line += "\n " + theme.fg("dim", findings);
-      }
-
-      if (!line.trim()) return undefined;
-      const subtleBg = (text: string) => `\x1b[48;2;30;28;44m${text}\x1b[0m`;
-      return new Text(line, 0, 1, subtleBg);
-    },
-  );
+      // ── Custom notification renderer ───────────────────────────────────────
+      pi.registerMessageRenderer?.("task-complete", createTaskCompleteRenderer());
 
   interface PreparedBatchTask {
     id: string;
-    agent: AgentConfig;
     agentType: string;
-    prompt: string;
     description: string;
     sessionName: string;
-    promptContent: string;
+    sessionDir: string;
     shellCommand: string;
+    tmuxCommand: string;
     runSdk: () => Promise<{ output: string; sessionPath?: string }>;
   }
 
@@ -758,33 +195,21 @@ export default function (pi: ExtensionAPI) {
     return `${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
   }
 
-  function buildTaskPromptContent(input: {
-    agent: AgentConfig;
-    prompt: string;
-    description: string;
-    cwd: string;
-  }): string {
-    return [
-      `# Task: ${input.description}`,
-      "",
-      `## Agent`,
-      `${input.agent.name} (${input.agent.source})`,
-      "",
-      `## Instructions`,
-      input.prompt,
-      "",
-      `## Working Directory`,
-      input.cwd,
-      "",
-      `## Output`,
-      "Your final assistant message is the result. End with a clear summary of what you did and any findings. No file write is required.",
-      "",
-      "Use this format for the summary:",
-      "",
-      "```",
-      TASK_RESULT_XML_INSTRUCTIONS,
-      "```",
-    ].join("\n");
+  function paneBackendFor(
+    backendName: SubagentBackendName | undefined,
+  ): SubagentPaneBackend | undefined {
+    if (backendName === "sdk") return undefined;
+    return paneBackends.find(
+      (backend) => backend.name === (backendName ?? "tmux"),
+    );
+  }
+
+  function paneIsAlive(
+    backendName: SubagentBackendName | undefined,
+    paneId: string | undefined,
+  ): boolean {
+    if (!paneId || backendName === "sdk") return false;
+    return paneBackendFor(backendName)?.exists(paneId) ?? false;
   }
 
   async function prepareBatchTask(input: {
@@ -793,56 +218,65 @@ export default function (pi: ExtensionAPI) {
     description: string;
     cwd: string;
     artifactsDir: string;
-    sessionDir: string;
     parentToolNames: string[];
     ctx: ExtensionContext;
   }): Promise<PreparedBatchTask> {
     const id = newTaskId();
     const sessionName = `task-${id}`;
-    const promptContent = buildTaskPromptContent({
-      agent: input.agent,
-      prompt: input.prompt,
+    const sessionDir = join(input.artifactsDir, "sessions", id);
+    await mkdir(sessionDir, { recursive: true });
+
+    const promptContent = buildTaskPrompt({
       description: input.description,
+      agentName: input.agent.name,
+      agentSource: input.agent.source,
+      prompt: input.prompt,
       cwd: input.cwd,
     });
     const piArgs = buildPiArgs(
       input.agent,
       sessionName,
-      input.sessionDir,
+      sessionDir,
       promptContent,
       false,
       input.parentToolNames,
     );
-    const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+    const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((arg) => shellQuote(arg)).join(" ")}`;
+    const sessionFile = join(sessionDir, `${sessionName}.jsonl`);
     const toolSelection = buildAgentToolSelection({
       tools: input.agent.tools,
       disallowedTools: input.agent.disallowedTools,
       parentToolNames: input.parentToolNames,
     });
-    const runSdk = () =>
-      runSdkSubagent({
-        prompt: promptContent,
-        agent: input.agent,
-        cwd: input.cwd,
-        ctx: input.ctx,
-        model: input.agent.model,
-        thinkingLevel: input.agent.thinking,
-        tools: toolSelection.tools,
-        excludeTools: toolSelection.excludeTools,
-        systemPrompt: input.agent.body,
-      });
 
     return {
       id,
-      agent: input.agent,
       agentType: input.agent.name,
-      prompt: input.prompt,
       description: input.description,
       sessionName,
-      promptContent,
+      sessionDir,
       shellCommand,
-      runSdk,
+      tmuxCommand: wrapWithPaneExitWatcher(sessionFile, shellCommand),
+      runSdk: () =>
+        runSdkSubagent({
+          prompt: promptContent,
+          agent: input.agent,
+          cwd: input.cwd,
+          ctx: input.ctx,
+          model: input.agent.model,
+          thinkingLevel: input.agent.thinking,
+          tools: toolSelection.tools,
+          excludeTools: toolSelection.excludeTools,
+          systemPrompt: input.agent.body,
+        }),
     };
+  }
+
+  function finalizeBatchTaskPane(task: BackgroundTask): void {
+    if (task.backend === "sdk") return;
+    paneBackends
+      .find((backend) => backend.name === (task.backend ?? "tmux"))
+      ?.kill(task.paneId, task.originalPane);
   }
 
   function registerBackgroundBatchTask(input: RegisteredBatchTaskInput): {
@@ -906,6 +340,7 @@ export default function (pi: ExtensionAPI) {
         backend: input.backend,
         paneId: input.paneId,
         sessionName: input.prepared.sessionName,
+        sessionDir: input.prepared.sessionDir,
         artifactDir: input.artifactsDir,
       },
     };
@@ -923,23 +358,18 @@ export default function (pi: ExtensionAPI) {
       "abort",
       () => {
         if (!backgroundTasks.delete(id)) return;
-        finalizeTaskPane(task, "cancelled");
+        finalizeBatchTaskPane(task);
         clearTaskWidgetIfIdle();
-        const remaining = readRegistry(taskPiDir).filter((e) => e.id !== id);
-        writeRegistry(taskPiDir, remaining);
+        writeRegistry(
+          taskPiDir,
+          readRegistry(taskPiDir).filter((candidate) => candidate.id !== id),
+        );
         upsertTaskSessionHistory(taskPiDir, {
           ...entry,
           status: "cancelled",
           completedAt: Date.now(),
           background: true,
         });
-        if (backgroundTasks.size === 0) {
-          stopWidget();
-          if (widgetCtx) {
-            widgetCtx.ui.setWidget("task", undefined);
-            widgetCtx = null;
-          }
-        }
       },
       { once: true },
     );
@@ -952,7 +382,7 @@ export default function (pi: ExtensionAPI) {
   ): void {
     void prepared
       .runSdk()
-      .then(async ({ output }) => {
+      .then(({ output }) => {
         if (!backgroundTasks.delete(prepared.id)) return;
         const finalOutput =
           output || "SDK subagent completed without assistant text.";
@@ -964,6 +394,7 @@ export default function (pi: ExtensionAPI) {
           finalOutput,
           "done",
           taskPiDir,
+          paneBackends,
         );
       })
       .catch((error) => {
@@ -977,6 +408,7 @@ export default function (pi: ExtensionAPI) {
           `Task ${prepared.id} failed: ${message}`,
           "failed",
           taskPiDir,
+          paneBackends,
         );
       });
   }
@@ -997,56 +429,10 @@ export default function (pi: ExtensionAPI) {
       "For background tasks: DO NOT sleep, poll, or check on progress. You'll be notified",
       "After delegated work completes, read changed files, review diff, verify scope, and run relevant checks",
       "Send the user a concise summary of the result since the agent's output is not user-visible",
-    ],
-    parameters: Type.Object({
-      agent_type: Type.String({
-        description: "The type of specialist agent to use for this task",
-      }),
-      prompt: Type.String({
-        description:
-          "The complete task for the agent to perform. Be detailed and self-contained.",
-      }),
-      description: Type.String({
-        description: "A short (3-5 word) summary of the task",
-      }),
-      task_id: Type.Optional(
-        Type.String({
-          description:
-            "Resume an existing background task by id instead of starting a new task.",
-        }),
-      ),
-      conversation_id: Type.Optional(
-        Type.String({
-          description:
-            "Durable specialist conversation id. Reuses .pi/artifacts/task-<id>/sessions when called again.",
-        }),
-      ),
+        ],
+        parameters: taskParametersSchema(),
 
-      background: Type.Optional(
-        Type.Boolean({
-          description:
-            "Run in background (async). You will be notified when it completes. DO NOT sleep, poll, ask the task for status, or duplicate its work while it runs in background.",
-          default: true,
-        }),
-      ),
-      backend: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("auto"),
-            Type.Literal("herdr"),
-            Type.Literal("tmux"),
-            Type.Literal("sdk"),
-          ],
-          {
-            description:
-              "Execution backend. auto prefers herdr inside Herdr, then tmux, then SDK.",
-            default: "auto",
-          },
-        ),
-      ),
-    }),
-
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const { agents, piDir } = discoverAgents(ctx.cwd, BUNDLED_AGENT_DIR);
       const parentToolNames = pi
         .getAllTools()
@@ -1100,35 +486,17 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      let id: string;
-      let sessionName: string;
-      let resultPath: string;
-      let resume = false;
-      let resumeSessionRef: string | undefined;
+          let id: string;
+          let sessionName: string;
+          let resume = false;
+          let resumeSessionRef: string | undefined;
 
-      const artifactsDir = join(piDir, "artifacts");
+          const artifactsDir = join(piDir, "artifacts");
 
-      if (registeredTaskId) {
-        id = registeredTaskId;
-        sessionName = conversationId ?? `task-${id}`;
-        resultPath = join(artifactsDir, `RESULT-${id}.md`);
-        if (!existsSync(resultPath)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `conversation_id "${conversationId}" has no prior result file at ${resultPath}. Cannot resume.`,
-              },
-            ],
-            details: {
-              phase: "failed" as const,
-              error: "Conversation result missing",
-              conversation_id: conversationId,
-            },
-            isError: true,
-          };
-        }
-        const block = readTaskBlock(piDir, id);
+          if (registeredTaskId) {
+            id = registeredTaskId;
+            sessionName = conversationId ?? `task-${id}`;
+            const block = readTaskBlock(piDir, id);
         const previousMetadata = parseMetadataFromBody(block?.body);
         const metadataAgent = previousMetadata?.agent_type;
         if (metadataAgent && metadataAgent !== agent.name) {
@@ -1155,7 +523,7 @@ export default function (pi: ExtensionAPI) {
         if (
           params.background !== false &&
           entry?.paneId &&
-          registryPaneIsAlive(entry)
+          paneIsAlive(entry.backend ?? "tmux", entry.paneId)
         ) {
           const bgtask: BackgroundTask = {
             backend: entry.backend ?? "tmux",
@@ -1252,17 +620,16 @@ export default function (pi: ExtensionAPI) {
         }
         // Resume: reuse the existing session name; runtime files are
         // flat in artifactsDir, no per-task subdir.
-        id = entry.id;
-        sessionName = entry.sessionName;
-        resultPath = join(artifactsDir, `RESULT-${id}.md`);
-        resume = true;
-        resumeSessionRef = entry.sessionRef;
+         id = entry.id;
+         sessionName = entry.sessionName;
+         resume = true;
+         resumeSessionRef = entry.sessionRef;
 
         // If background and pane still alive, reattach to tracker
         if (
           params.background !== false &&
           entry.paneId &&
-          registryPaneIsAlive(entry)
+          paneIsAlive(entry.backend ?? "tmux", entry.paneId)
         ) {
           const bgtask: BackgroundTask = {
             backend: entry.backend ?? "tmux",
@@ -1315,16 +682,25 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-      } else {
-        id = `${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
-        sessionName = conversationId ?? `task-${id}`;
-        resultPath = join(artifactsDir, `RESULT-${id}.md`);
-      }
+       } else {
+         id = `${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
+         sessionName = conversationId ?? `task-${id}`;
+       }
 
+      const envBackend =
+        process.env.PI_TASK_BACKEND === "herdr" ||
+        process.env.PI_TASK_BACKEND === "tmux" ||
+        process.env.PI_TASK_BACKEND === "sdk"
+          ? process.env.PI_TASK_BACKEND
+          : process.env.PI_TASK_USE_TMUX_BACKEND === "1"
+            ? "tmux"
+            : process.env.PI_TASK_USE_SDK_BACKEND === "1"
+              ? "sdk"
+              : undefined;
       let backendSelection;
       try {
         backendSelection = selectSubagentBackend(
-          params.backend ?? "auto",
+          params.backend ?? envBackend ?? "auto",
           paneBackends,
         );
       } catch (error) {
@@ -1344,12 +720,12 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: "Resuming saved sessions requires the herdr or tmux CLI backend so Pi can reopen the subagent session. Select an available pane backend, or use SDK only for a new one-shot task.",
+              text: "Durable conversations and task resume require the Herdr or tmux CLI backend so Pi can save and reopen the subagent session. Choose backend:\"herdr\" or backend:\"tmux\", or omit conversation_id/task_id for a one-shot SDK task.",
             },
           ],
           details: {
             phase: "failed" as const,
-            error: "CLI pane backend required for session resume",
+            error: "pane backend required for durable conversation or resume",
             conversation_id: conversationId,
           },
           isError: true,
@@ -1370,31 +746,17 @@ export default function (pi: ExtensionAPI) {
       const isBackground = params.background ?? TASK_BACKGROUND_DEFAULT;
       // default true
 
-      // ── Build the prompt (instructions are inlined; no CONTEXT.md file) ─
-      const promptContent = [
-        `# Task: ${descText}`,
-        "",
-        `## Agent`,
-        `${agent.name} (${agent.source})`,
-        "",
-        `## Instructions`,
-        params.prompt,
-        "",
-        `## Working Directory`,
-        ctx.cwd,
-        "",
-        `## Output`,
-        "Your final assistant message is the result. End with a clear summary of what you did and any findings. No file write is required.",
-        "",
-        "Use this format for the summary:",
-        "",
-        "```",
-        TASK_RESULT_XML_INSTRUCTIONS,
-        "```",
-      ].join("\n");
+          // ── Build the prompt (instructions are inlined; no CONTEXT.md file) ─
+          const promptContent = buildTaskPrompt({
+            description: descText,
+            agentName: agent.name,
+            agentSource: agent.source,
+            prompt: params.prompt,
+            cwd: ctx.cwd,
+          });
 
-      const sessionDir = join(artifactsDir, "sessions");
-      await mkdir(sessionDir, { recursive: true });
+          const sessionDir = join(artifactsDir, "sessions", id);
+          await mkdir(sessionDir, { recursive: true });
 
       // ─── Build and run the sub-agent pi process ──────────────────────────
       const piArgs = buildPiArgs(
@@ -1407,6 +769,7 @@ export default function (pi: ExtensionAPI) {
         resumeSessionRef,
       );
       const envPrefix = `PI_TASK_TOOL_DISABLED=1`;
+
       const toolSelection = buildAgentToolSelection({
         tools: agent.tools,
         disallowedTools: agent.disallowedTools,
@@ -1445,6 +808,9 @@ export default function (pi: ExtensionAPI) {
         ensureTaskWidget(ctx);
       }
 
+      // Prefer tmux when the parent Pi is running inside tmux so users can watch
+      // the subagent's interactive Pi TUI. Fall back to the SDK only when tmux is
+      // unavailable, or when explicitly forced with PI_TASK_BACKEND=sdk.
       if (backendSelection.name === "sdk") {
         if (isBackground) {
           const bgtask: BackgroundTask = {
@@ -1487,16 +853,24 @@ export default function (pi: ExtensionAPI) {
 
           void runSdkFallback()
             .then(async ({ output }) => {
-              if (!backgroundTasks.delete(id)) return;
               const finalOutput =
                 output || "SDK subagent completed without assistant text.";
+              backgroundTasks.delete(id);
               clearTaskWidgetIfIdle();
-              completeTask(pi, id, bgtask, finalOutput, "done", piDir);
+              completeTask(
+                pi,
+                id,
+                bgtask,
+                finalOutput,
+                "done",
+                piDir,
+                paneBackends,
+              );
             })
             .catch((error) => {
-              if (!backgroundTasks.delete(id)) return;
               const message =
                 error instanceof Error ? error.message : String(error);
+              backgroundTasks.delete(id);
               clearTaskWidgetIfIdle();
               completeTask(
                 pi,
@@ -1505,6 +879,7 @@ export default function (pi: ExtensionAPI) {
                 `Task ${id} failed: ${message}`,
                 "failed",
                 piDir,
+                paneBackends,
               );
             });
 
@@ -1512,30 +887,20 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text" as const,
-                text: formatBackgroundReceipt({
-                  taskId: id,
-                  agentType: agent.name,
-                  backend: "sdk",
-                  sessionName,
-                  artifactDir: artifactsDir,
-                }),
+                text: `Task ${id} started with SDK backend.`,
               },
             ],
-            details: {
-              task_id: id,
-              agent_type: agent.name,
-              description: descText,
-              background: true,
-              backend: "sdk" as const,
-              session_name: sessionName,
-              result_path: resultPath,
-              conversation_id: conversationId,
-            },
-          };
-        }
+                details: {
+                  task_id: id,
+                  backend: "sdk" as const,
+                  background: true,
+                  conversation_id: conversationId,
+                },
+              };
+            }
 
-        try {
-          const { output, sessionPath } = await runSdkFallback();
+            try {
+              const { output, sessionPath } = await runSdkFallback();
           const finalOutput =
             output || "SDK subagent completed without assistant text.";
           if (conversationId) {
@@ -1549,15 +914,14 @@ export default function (pi: ExtensionAPI) {
               result: finalOutput,
             });
           }
-          return {
-            content: [{ type: "text" as const, text: finalOutput }],
-            details: {
-              phase: "done" as const,
-              backend: "sdk" as const,
-              session_path: sessionPath,
-              result_path: resultPath,
-              conversation_id: conversationId,
-            },
+              return {
+                content: [{ type: "text" as const, text: finalOutput }],
+                details: {
+                  phase: "done" as const,
+                  backend: "sdk" as const,
+                  session_path: sessionPath,
+                  conversation_id: conversationId,
+                },
           };
         } catch (error) {
           const message =
@@ -1580,39 +944,55 @@ export default function (pi: ExtensionAPI) {
       }
 
       const shellCommand = `${envPrefix} pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+      const sessionFile = join(sessionDir, sessionName + ".jsonl");
       const paneBackend = backendSelection.paneBackend;
       if (!paneBackend) {
-        throw new Error(`Missing pane backend for ${backendSelection.name}.`);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Missing pane backend for ${backendSelection.name}.`,
+            },
+          ],
+          details: {
+            phase: "failed" as const,
+            error: `Missing pane backend for ${backendSelection.name}`,
+          },
+          isError: true,
+        };
       }
 
       let paneId: string;
       let originalPane: string | null;
       try {
-        const splitResult = paneBackend.spawn({
+        const pane = paneBackend.spawn({
           cwd: ctx.cwd,
-          command: shellCommand,
+          command: `cd ${shellQuote(ctx.cwd)} && ${shellCommand}`,
+          sessionFilePath: sessionFile,
           description: descText,
           agentType: agent.name,
         });
-        paneId = splitResult.paneId;
-        originalPane = splitResult.originalPane;
+        paneId = pane.paneId;
+        originalPane = pane.originalPane;
         if (foregroundTask) {
           foregroundTask.paneId = paneId;
           foregroundTask.originalPane = originalPane;
         }
-      } catch (error) {
-        paneBackend.rollbackSpawn();
+      } catch {
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
-        const message = error instanceof Error ? error.message : String(error);
         return {
           content: [
             {
-              type: "text" as const,
-              text: `Failed to create ${backendSelection.name} pane for the agent: ${message}`,
-            },
-          ],
-          details: { phase: "failed" as const, error: message },
+                type: "text" as const,
+                text: `Failed to create ${backendSelection.name} pane for the agent.`,
+              },
+            ],
+          details: {
+            phase: "failed" as const,
+            backend: backendSelection.name,
+            error: `${backendSelection.name} spawn failed`,
+          },
           isError: true,
         };
       }
@@ -1625,7 +1005,6 @@ export default function (pi: ExtensionAPI) {
           agentType: agent.name,
           description: descText,
           sessionName,
-          backend: backendSelection.name,
           startedAt,
           paneId,
           piDir,
@@ -1635,35 +1014,49 @@ export default function (pi: ExtensionAPI) {
           background: false,
         });
 
+        // Poll tool-call progress while waiting for completion
+        let lastToolCalls = -1;
+        const onAbort = () => clearInterval(toolProgressInterval);
+        const toolProgressInterval = setInterval(() => {
+          try {
+            const stats = countToolUses(sessionDir, sessionName);
+            if (stats.toolUses > 0 && stats.toolUses !== lastToolCalls) {
+              lastToolCalls = stats.toolUses;
+              _onUpdate?.({
+                content: [
+                  {
+                    type: "text",
+                    text: `${stats.toolUses} tool call${stats.toolUses !== 1 ? "s" : ""}`,
+                  },
+                ],
+                details: { toolCalls: stats.toolUses },
+              });
+            }
+          } catch {
+            // session file may not exist yet
+          }
+        }, COUNT_POLL_MS);
+        signal?.addEventListener("abort", onAbort, { once: true });
+
         const completion = await waitForSessionTaskCompletion({
-          resultPath,
           sessionDir,
           sessionName,
           paneId,
-          paneExists: (candidatePaneId) =>
-            paneBackend.exists(candidatePaneId),
+          paneExists: (candidatePaneId) => paneBackend.exists(candidatePaneId),
           signal,
           timeoutMs: TASK_TIMEOUT_MS,
           pollMs: 1000,
           sinceMs: startedAt,
         });
+        clearInterval(toolProgressInterval);
+        signal?.removeEventListener("abort", onAbort);
         const content = completion.content;
-        const phase: TaskTerminalPhase =
+        const phase =
           completion.status === "completed"
             ? "done"
-            : completion.status === "timeout"
-              ? "timeout"
-              : completion.status === "cancelled"
-                ? "cancelled"
-                : "failed";
-        const outcome: SubagentOutcome =
-          completion.status === "completed"
-            ? "completed"
-            : completion.status === "timeout"
-              ? "timeout"
-              : completion.status === "cancelled"
-                ? "cancelled"
-                : "failed";
+            : completion.status === "cancelled"
+              ? "cancelled"
+              : "failed";
         const completedSessionRef = findJsonlSessionByName(
           piDir,
           sessionName,
@@ -1674,22 +1067,26 @@ export default function (pi: ExtensionAPI) {
           agentType: agent.name,
           description: descText,
           sessionName,
-          backend: backendSelection.name,
           startedAt,
           paneId,
           piDir,
           dir: artifactsDir,
           conversationId,
           sessionRef: completedSessionRef,
+          backend: backendSelection.name,
           status: phase,
           completedAt: Date.now(),
           background: false,
         });
-        if (foregroundTask) {
-          finalizeTaskPane(foregroundTask, outcome);
-        } else {
-          paneBackend.finalize(paneId, originalPane, outcome);
-        }
+        paneBackend.finalize(
+          paneId,
+          originalPane,
+          phase === "done"
+            ? "completed"
+            : phase === "cancelled"
+              ? "cancelled"
+              : "failed",
+        );
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
 
@@ -1709,40 +1106,34 @@ export default function (pi: ExtensionAPI) {
         const durationMs = Date.now() - startedAt;
         const { toolUses, turns } = countToolUses(sessionDir, sessionName);
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `${parsed.status || "done"}: ${parsed.summary || content.slice(0, 300)}`,
-                toolUses > 0 ? `\n${toolUses} toolcalls` : "",
-                durationMs >= 1000 ? `\n${formatMs(durationMs)}` : "",
-              ]
-                .filter(Boolean)
-                .join(""),
-            },
-          ],
-          details: {
-            task_id: id,
-            agent_type: agent.name,
-            description: descText,
-            phase,
-            status: phase === "done" ? parsed.status || "done" : phase,
-            summary: parsed.summary || "",
-            findings: parsed.findings || "",
-            evidence: parsed.evidence || "",
-            confidence: parsed.confidence || "",
-            duration_ms: durationMs,
-            tool_uses: toolUses,
-            turn_count: turns,
-            background: false,
-            backend: backendSelection.name,
-            pane_id: paneId,
-            session_name: sessionName,
-            conversation_id: conversationId,
-          },
-        };
-      }
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: parsed.summary || content.trim(),
+                },
+              ],
+              details: {
+                task_id: id,
+                agent_type: agent.name,
+                description: descText,
+                phase,
+                status: "done",
+                summary: parsed.summary || "",
+                findings: parsed.findings || "",
+                evidence: parsed.evidence || "",
+                confidence: parsed.confidence || "",
+                duration_ms: durationMs,
+                tool_uses: toolUses,
+                turn_count: turns,
+                background: false,
+                backend: backendSelection.name,
+                pane_id: paneId,
+                session_name: sessionName,
+                conversation_id: conversationId,
+              },
+            };
+          }
 
       // ── BACKGROUND MODE (default): add to tracker, return immediately ─────
 
@@ -1794,25 +1185,13 @@ export default function (pi: ExtensionAPI) {
         signal.addEventListener(
           "abort",
           () => {
-            if (!backgroundTasks.delete(id)) return;
-            finalizeTaskPane(bgtask, "cancelled");
+            paneBackend.kill(paneId, originalPane);
+            backgroundTasks.delete(id);
             clearTaskWidgetIfIdle();
             // Clean registry
             const remaining = readRegistry(piDir).filter((e) => e.id !== id);
             writeRegistry(piDir, remaining);
-            upsertTaskSessionHistory(piDir, {
-              ...entry,
-              status: "cancelled",
-              completedAt: Date.now(),
-              background: true,
-            });
-            if (backgroundTasks.size === 0) {
-              stopWidget();
-              if (widgetCtx) {
-                widgetCtx.ui.setWidget("task", undefined);
-                widgetCtx = null;
-              }
-            }
+                clearTaskWidgetIfIdle();
           },
           { once: true },
         );
@@ -1847,99 +1226,8 @@ export default function (pi: ExtensionAPI) {
       };
     },
 
-    renderCall(args, theme, _context) {
-      const agentName =
-        ((args as Record<string, unknown>).agent_type as string) || "...";
-      const desc =
-        ((args as Record<string, unknown>).description as string) || "";
-
-      let text = theme.fg("toolTitle", "");
-      text += theme.fg("accent", agentName);
-      if (desc) text += theme.fg("dim", ` - ${desc}`);
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, { expanded }, theme, _context) {
-      const d = result.details as TaskDetails | undefined;
-      if (!d) return new Text("", 0, 0);
-
-      if (d.background) {
-        const toolUses = d.tool_uses || 0;
-        const durationMs = d.duration_ms || 0;
-        const confidence = d.confidence || "";
-
-        const useStr = toolUses > 0 ? `${toolUses} toolcalls` : "";
-        const durStr = durationMs >= 1000 ? formatMs(durationMs) : "";
-        const statsParts = [useStr, durStr].filter(Boolean);
-        const statsText = statsParts.join(" \u2022 ");
-        const confStr = confidence ? `[${confidence.toUpperCase()}]` : "";
-        const statsLine = [confStr, statsText].filter(Boolean).join(" ");
-
-        const subtleBg = (text: string) => `\x1b[48;2;30;28;44m${text}\x1b[0m`;
-        return new Text(
-          statsLine ? " " + theme.fg("dim", statsLine.trim()) : "",
-          0,
-          0,
-          subtleBg,
-        );
-      }
-
-      if (
-        d.phase === "timeout" ||
-        d.phase === "cancelled" ||
-        d.phase === "aborted" ||
-        d.phase === "failed"
-      ) {
-        const line =
-          theme.fg("error", "x") + " " + theme.fg("dim", `[${d.phase}]`);
-        return new Text(line, 0, 0);
-      }
-
-      const isError =
-        d.status === "failure" ||
-        d.status === "blocked" ||
-        d.status === "unknown" ||
-        d.status === "timeout" ||
-        d.status === "cancelled" ||
-        d.status === "failed";
-
-      const durationMs = d.duration_ms || 0;
-      const toolUses = d.tool_uses || 0;
-
-      const useStr = toolUses > 0 ? `${toolUses} toolcalls` : "";
-      const durStr = durationMs >= 1000 ? formatMs(durationMs) : "";
-      const statsParts = [useStr, durStr].filter(Boolean);
-      const statsStr = statsParts.length
-        ? " " + theme.fg("dim", statsParts.join(" • "))
-        : "";
-
-      const icon = isError ? theme.fg("error", "x") : theme.fg("success", "✓");
-      const statusLabel = d.status && d.status !== "done" ? d.status : "done";
-      let line =
-        icon +
-        " " +
-        theme.fg(isError ? "error" : "success", statusLabel) +
-        statsStr;
-
-      if (expanded) {
-        const s = d.summary || "";
-        const f = d.findings || "";
-        const e = d.evidence || "";
-        if (s) line += "\n" + theme.fg("muted", s);
-        if (f) line += "\n" + theme.fg("dim", f);
-        if (e)
-          line += "\n" + theme.fg("muted", "Evidence: ") + theme.fg("dim", e);
-      } else {
-        const preview = (d.summary || "").slice(0, 80);
-        if (preview) line += "\n" + theme.fg("dim", `  ⎿  ${preview}`);
-        else
-          line +=
-            "\n" +
-            theme.fg("dim", `  ⎿  ${isError ? d.status || "error" : "Done"}`);
-      }
-
-      return new Text(line, 0, 0);
-    },
+        renderCall,
+        renderResult,
   });
 
   pi.registerTool({
@@ -1954,48 +1242,7 @@ export default function (pi: ExtensionAPI) {
       "Do not poll or duplicate delegated work while the batch runs",
       "Review completion results before reporting final conclusions",
     ],
-    parameters: Type.Object({
-      tasks: Type.Array(
-        Type.Object({
-          agent_type: Type.String({
-            description: "The type of specialist agent to use for this task",
-          }),
-          prompt: Type.String({
-            description:
-              "The complete task for the agent to perform. Be detailed and self-contained.",
-          }),
-          description: Type.String({
-            description: "A short (3-5 word) summary of this task",
-          }),
-        }),
-        {
-          description: `Batch items to launch. Must contain ${TASK_BATCH_MIN_TASKS}-${TASK_BATCH_MAX_TASKS} tasks.`,
-          minItems: TASK_BATCH_MIN_TASKS,
-          maxItems: TASK_BATCH_MAX_TASKS,
-        },
-      ),
-      backend: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("auto"),
-            Type.Literal("herdr"),
-            Type.Literal("tmux"),
-            Type.Literal("sdk"),
-          ],
-          {
-            description:
-              "Execution backend. auto prefers herdr inside Herdr, then tmux, then SDK.",
-            default: "auto",
-          },
-        ),
-      ),
-      tab_label: Type.Optional(
-        Type.String({
-          description:
-            "Optional Herdr tab label for this batch. Ignored by tmux and SDK.",
-        }),
-      ),
-    }),
+    parameters: taskBatchParametersSchema(),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const validation = validateTaskBatchTasks(params.tasks);
@@ -2062,8 +1309,7 @@ export default function (pi: ExtensionAPI) {
           ? params.tab_label.trim()
           : undefined;
       const artifactsDir = join(discoveredPiDir, "artifacts");
-      const sessionDir = join(artifactsDir, "sessions");
-      await mkdir(sessionDir, { recursive: true });
+      await mkdir(join(artifactsDir, "sessions"), { recursive: true });
       const parentToolNames = pi
         .getAllTools()
         .map((tool) => tool.name)
@@ -2077,7 +1323,6 @@ export default function (pi: ExtensionAPI) {
             description: task.description,
             cwd: ctx.cwd,
             artifactsDir,
-            sessionDir,
             parentToolNames,
             ctx,
           }),
@@ -2184,13 +1429,12 @@ export default function (pi: ExtensionAPI) {
             try {
               const pane = paneBackend.spawn({
                 cwd: ctx.cwd,
-                command: task.shellCommand,
+                command: task.tmuxCommand,
                 description: task.description,
                 agentType: task.agentType,
               });
               registerLaunched(task, index, pane.paneId, pane.originalPane);
             } catch (error) {
-              paneBackend.rollbackSpawn();
               const message =
                 error instanceof Error ? error.message : String(error);
               errors.push({
@@ -2233,6 +1477,8 @@ export default function (pi: ExtensionAPI) {
         launched_count: launched.length,
         task_ids: launched.map((task) => task.taskId),
         session_names: launched.map((task) => task.sessionName),
+        session_dirs: launched.map((task) => task.sessionDir),
+        artifact_dir: artifactsDir,
         pane_ids: launched
           .map((task) => task.paneId)
           .filter((paneId): paneId is string => Boolean(paneId)),
@@ -2241,15 +1487,7 @@ export default function (pi: ExtensionAPI) {
 
       if (launched.length === 0) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                errors.length > 0
-                  ? receipt
-                  : `No task_batch items launched for ${batchId}.`,
-            },
-          ],
+          content: [{ type: "text" as const, text: receipt }],
           details: {
             ...details,
             phase: "failed" as const,
@@ -2263,42 +1501,6 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text" as const, text: receipt }],
         details,
       };
-    },
-
-    renderCall(args, theme, _context) {
-      const count = Array.isArray((args as Record<string, unknown>).tasks)
-        ? ((args as Record<string, unknown>).tasks as unknown[]).length
-        : 0;
-      const text =
-        theme.fg("toolTitle", "") +
-        theme.fg("accent", "batch") +
-        theme.fg("dim", count > 0 ? ` - ${count} tasks` : "");
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme, _context) {
-      const d = result.details as
-        | {
-            batch_id?: string;
-            launched_count?: number;
-            requested_count?: number;
-            backend?: string;
-            errors?: unknown[];
-          }
-        | undefined;
-      if (!d) return new Text("", 0, 0);
-      const launched = d.launched_count ?? 0;
-      const requested = d.requested_count ?? launched;
-      const hasErrors = Array.isArray(d.errors) && d.errors.length > 0;
-      const icon = hasErrors ? theme.fg("error", "x") : theme.fg("success", "✓");
-      return new Text(
-        `${icon} ${theme.fg("accent", d.batch_id ?? "task_batch")} ${theme.fg(
-          "dim",
-          `${launched}/${requested} launched${d.backend ? ` via ${d.backend}` : ""}`,
-        )}`,
-        0,
-        0,
-      );
     },
   });
 

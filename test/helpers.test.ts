@@ -23,7 +23,7 @@ import {
   TASK_BATCH_MAX_TASKS,
   TASK_BATCH_MIN_TASKS,
   TASK_BATCH_TOOL_DESCRIPTION,
-  TASK_RESULT_XML_INSTRUCTIONS,
+  TASK_PROMPT_INSTRUCTIONS,
   TASK_TOOL_DESCRIPTION,
   countToolUses,
   readRecentToolCalls,
@@ -92,10 +92,10 @@ import {
 }
 
 {
-  const t = "parseResultXml truncates summary to 500 chars for plain text";
+  const t = "parseResultXml preserves plain text summaries";
   const longText = "x".repeat(600);
   const r = parseResultXml(longText);
-  assert.equal(r.summary.length, 500, t);
+  assert.equal(r.summary, longText, t);
 }
 
 {
@@ -989,8 +989,6 @@ import {
       agent_type: " explore ",
       prompt: " inspect files ",
       description: " inspect ",
-      backend: "herdr",
-      conversation_id: " batch-a ",
     },
   ]);
 
@@ -1002,8 +1000,6 @@ import {
       agent_type: "explore",
       prompt: "inspect files",
       description: "inspect",
-      backend: "herdr",
-      conversation_id: "batch-a",
     },
     t + " task",
   );
@@ -1021,16 +1017,35 @@ import {
   assert.equal(missingPrompt.ok, false, t + " missing prompt");
   assert.match(missingPrompt.error, /task 1 requires a non-empty prompt/, t);
 
-  const badBackend = validateTaskBatchTasks([
+  const itemBackend = validateTaskBatchTasks([
     {
       agent_type: "explore",
       prompt: "scan",
       description: "scan",
-      backend: "bogus",
+      backend: "herdr",
     },
   ]);
-  assert.equal(badBackend.ok, false, t + " bad backend");
-  assert.match(badBackend.error, /backend must be/, t + " backend message");
+  assert.equal(itemBackend.ok, false, t + " item backend");
+  assert.match(
+    itemBackend.error,
+    /must not include backend/,
+    t + " backend message",
+  );
+
+  const itemConversation = validateTaskBatchTasks([
+    {
+      agent_type: "explore",
+      prompt: "scan",
+      description: "scan",
+      conversation_id: "resume-me",
+    },
+  ]);
+  assert.equal(itemConversation.ok, false, t + " item conversation");
+  assert.match(
+    itemConversation.error,
+    /must not include task_id or conversation_id/,
+    t + " conversation message",
+  );
 }
 
 {
@@ -1043,6 +1058,7 @@ import {
       backend: "herdr",
       paneId: "w1:p2",
       sessionName: "task-task-a",
+      sessionDir: "/tmp/.pi/artifacts/sessions/task-a",
       artifactDir: "/tmp/.pi/artifacts",
     },
     {
@@ -1051,6 +1067,7 @@ import {
       description: "review tests",
       backend: "sdk",
       sessionName: "task-task-b",
+      sessionDir: "/tmp/.pi/artifacts/sessions/task-b",
       artifactDir: "/tmp/.pi/artifacts",
     },
   ]);
@@ -1058,6 +1075,10 @@ import {
   assert.ok(receipt.includes("Started 2 background tasks"), t + " heading");
   assert.ok(receipt.includes("1. task-a (explore)"), t + " first task");
   assert.ok(receipt.includes("Pane: w1:p2"), t + " pane");
+  assert.ok(
+    receipt.includes("Session directory: /tmp/.pi/artifacts/sessions/task-a"),
+    t + " session dir",
+  );
   assert.ok(receipt.includes("2. task-b (reviewer)"), t + " second task");
   assert.ok(
     receipt.includes("Completion notifications"),
@@ -1075,8 +1096,8 @@ import {
       backend: "tmux",
       paneId: "%7",
       sessionName: "task-task-a",
+      sessionDir: "/tmp/.pi/artifacts/sessions/task-a",
       artifactDir: "/tmp/.pi/artifacts",
-      conversationId: "helpers-a",
     },
   ]);
 
@@ -1092,8 +1113,8 @@ import {
       backend: "tmux",
       pane_id: "%7",
       session_name: "task-task-a",
+      session_dir: "/tmp/.pi/artifacts/sessions/task-a",
       artifact_dir: "/tmp/.pi/artifacts",
-      conversation_id: "helpers-a",
       background: true,
     },
     t + " task detail",
@@ -1131,17 +1152,23 @@ import {
 }
 
 {
-  const t = "XML instructions preserve the required task result tags";
-  for (const tag of ["status", "summary", "findings", "evidence", "files"]) {
-    assert.ok(
-      TASK_RESULT_XML_INSTRUCTIONS.includes(`<${tag}>`),
-      `${t}: has opening ${tag}`,
-    );
-    assert.ok(
-      TASK_RESULT_XML_INSTRUCTIONS.includes(`</${tag}>`),
-      `${t}: has closing ${tag}`,
-    );
-  }
+  const t = "task prompt instructions use JSONL final-message results";
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("final assistant message IS the result"),
+    t + " final message",
+  );
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("session JSONL"),
+    t + " mentions JSONL",
+  );
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("Do not write a RESULT.md file"),
+    t + " avoids result files",
+  );
+  assert.ok(
+    !TASK_PROMPT_INSTRUCTIONS.includes("<summary>"),
+    t + " avoids XML tags",
+  );
 }
 
 console.log("ALL TASK HELPER TESTS PASSED");

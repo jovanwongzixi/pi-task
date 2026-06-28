@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import {
   getLastAssistantTextFromSessionDir,
   hasAgentFinished,
@@ -18,11 +16,10 @@ export type TaskCompletionStatus =
 export interface TaskCompletionSnapshot {
   status: TaskCompletionStatus;
   content: string;
-  source?: "result-file" | "session-jsonl" | "pane" | "timeout" | "signal";
+  source?: "session-jsonl" | "pane" | "timeout" | "signal";
 }
 
-export interface TaskCompletionOptions {
-  resultPath: string;
+export interface WaitForTaskCompletionOptions {
   sessionDir: string;
   sessionName: string;
   paneId?: string;
@@ -33,15 +30,17 @@ export interface TaskCompletionOptions {
   sinceMs?: number;
 }
 
-async function readResultFile(resultPath: string): Promise<string | null> {
-  if (!existsSync(resultPath)) return null;
-  const text = (await readFile(resultPath, "utf-8")).trim();
-  return text.length > 0 ? text : null;
+function paneIsAlive(options: Pick<WaitForTaskCompletionOptions, "paneId" | "paneExists">): boolean {
+  return Boolean(
+    options.paneId &&
+      options.paneExists &&
+      options.paneExists(options.paneId),
+  );
 }
 
 /**
- * Read final assistant text only after Pi records agent_end. This prevents
- * streaming intermediate text from being mistaken for a completed result.
+ * The subagent's final assistant message from the auto-saved persistent JSONL
+ * session is the result. No RESULT.md polling is used.
  */
 function readSessionText(
   sessionDir: string,
@@ -58,21 +57,13 @@ function readSessionText(
 }
 
 export async function checkTaskCompletion(
-  options: TaskCompletionOptions,
+  options: Omit<WaitForTaskCompletionOptions, "signal" | "timeoutMs" | "pollMs">,
 ): Promise<TaskCompletionSnapshot> {
-  const paneIsAlive = () =>
-    options.paneId && options.paneExists
-      ? options.paneExists(options.paneId)
-      : false;
+  const alive = paneIsAlive(options);
 
-  // Give Pi a brief moment to flush its session after a pane exits.
-  if (options.paneId && options.paneExists && !paneIsAlive()) {
+  // If the pane has exited, give Pi a brief moment to flush JSONL.
+  if (options.paneId && options.paneExists && !alive) {
     await sleep(500);
-  }
-
-  const result = await readResultFile(options.resultPath);
-  if (result) {
-    return { status: "completed", content: result, source: "result-file" };
   }
 
   const sessionResult = readSessionText(
@@ -88,7 +79,7 @@ export async function checkTaskCompletion(
     };
   }
 
-  if (paneIsAlive()) {
+  if (alive) {
     return { status: "running", content: "", source: "pane" };
   }
 
@@ -99,7 +90,7 @@ export async function checkTaskCompletion(
 }
 
 export async function waitForTaskCompletion(
-  options: TaskCompletionOptions,
+  options: WaitForTaskCompletionOptions,
 ): Promise<TaskCompletionSnapshot> {
   const timeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
   const pollMs = options.pollMs ?? 1000;

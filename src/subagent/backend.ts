@@ -13,12 +13,14 @@ export interface SpawnSubagentOptions {
   command: string;
   description?: string;
   agentType?: string;
+  sessionFilePath?: string;
 }
 
 export interface SpawnSubagentBatchItemOptions {
   command: string;
   description?: string;
   agentType?: string;
+  sessionFilePath?: string;
 }
 
 export interface SpawnSubagentBatchOptions {
