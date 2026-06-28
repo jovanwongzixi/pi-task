@@ -13,18 +13,25 @@ export interface RunSdkSubagentOptions {
   systemPrompt?: string;
 }
 
-function resolveModel(ctx: ExtensionContext, requested?: string) {
+async function resolveModel(ctx: ExtensionContext, requested?: string) {
   const registry = ctx.modelRegistry as any;
-  const available = registry?.getAll?.() ?? registry?.getAvailable?.() ?? [];
   if (requested) {
     const [provider, ...rest] = requested.split("/");
     const modelId = rest.join("/");
-    const byProvider = available.find((model: any) => {
-      return model?.provider?.id === provider && model?.id === modelId;
-    });
-    if (byProvider) return byProvider;
+    const exact = modelId
+      ? registry?.find?.(provider, modelId)
+      : registry?.find?.(requested);
+    if (exact) return exact;
+  }
+
+  const all = registry?.getAll?.() ?? [];
+  const available = all.length > 0 ? all : ((await registry?.getAvailable?.()) ?? []);
+  if (requested) {
     const byId = available.find(
-      (model: any) => model?.id === requested || model?.name === requested,
+      (model: any) =>
+        model?.id === requested ||
+        `${model?.provider?.id ?? model?.provider}/${model?.id}` === requested ||
+        model?.name === requested,
     );
     if (byId) return byId;
   }
@@ -35,32 +42,50 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
   output: string;
   sessionPath?: string;
 }> {
-  const model = resolveModel(options.ctx, options.model ?? options.agent.model);
+  const model = await resolveModel(options.ctx, options.model ?? options.agent.model);
   if (!model) {
     throw new Error("No model available for SDK subagent execution");
   }
 
-  const { createAgentSession, DefaultResourceLoader } =
+  const { createAgentSession, DefaultResourceLoader, getAgentDir } =
     await import("@earendil-works/pi-coding-agent");
-  const resourceLoader = new DefaultResourceLoader({
-    cwd: options.cwd,
-    systemPromptOverride: options.systemPrompt,
-  } as any);
+  const previousDisabled = process.env.PI_TASK_TOOL_DISABLED;
+  process.env.PI_TASK_TOOL_DISABLED = "1";
+  let session: any;
+  try {
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: options.cwd,
+      agentDir,
+      systemPromptOverride: () => options.systemPrompt,
+      noExtensions: true,
+    } as any);
 
-  const { session } = await createAgentSession({
-    cwd: options.cwd,
-    model,
-    thinkingLevel: options.thinkingLevel as any,
-    tools: options.tools,
-    excludeTools: options.excludeTools,
-    resourceLoader,
-  });
+    await resourceLoader.reload();
 
-  await session.prompt(options.prompt);
+    ({ session } = await createAgentSession({
+      cwd: options.cwd,
+      agentDir,
+      model,
+      thinkingLevel: options.thinkingLevel as any,
+      tools: options.tools,
+      excludeTools: options.excludeTools,
+      resourceLoader,
+    }));
 
-  const sessionPath = session.sessionFile;
-  const output = getLastAssistantText(session.messages);
-  return { output: output.trim(), sessionPath };
+    await session.prompt(options.prompt);
+
+    const sessionPath = session.sessionFile;
+    const output = getLastAssistantText(session.messages);
+    return { output: output.trim(), sessionPath };
+  } finally {
+    session?.dispose?.();
+    if (previousDisabled === undefined) {
+      delete process.env.PI_TASK_TOOL_DISABLED;
+    } else {
+      process.env.PI_TASK_TOOL_DISABLED = previousDisabled;
+    }
+  }
 }
 
 function getLastAssistantText(messages: readonly any[]): string {

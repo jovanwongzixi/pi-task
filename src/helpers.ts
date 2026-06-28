@@ -78,16 +78,11 @@ export interface ToolCallRecord {
 
 export const TASK_BACKGROUND_DEFAULT = true;
 
-export const TASK_RESULT_XML_INSTRUCTIONS = `<status>success|failure|blocked|partial</status>
-<summary>One sentence: what was accomplished</summary>
-<findings>Key findings with file:line references</findings>
-<evidence>Verification evidence, commands run, output snippets</evidence>
-<confidence>high|medium|low (optional — how certain the findings are)</confidence>
-<files>Comma-separated absolute paths of files read/created (optional)</files>
+export const TASK_PROMPT_INSTRUCTIONS = `Your final assistant message IS the result the parent agent will read.
 
-Prefer writing this block to RESULT.md when done. If you cannot write the file, your final assistant message MUST include the same XML block.`;
+When you are done, end your final assistant message with a clear, self-contained summary in plain text. Do not wrap it in XML tags. Do not write a RESULT.md file — the parent agent reads your final assistant message from the session JSONL, not from any file.`;
 
-export const OUTPUT_FORMAT_GUIDE = TASK_RESULT_XML_INSTRUCTIONS;
+export const OUTPUT_FORMAT_GUIDE = TASK_PROMPT_INSTRUCTIONS;
 
 export const TASK_TOOL_DESCRIPTION = `Launch a new agent to handle complex, multistep tasks autonomously.
 
@@ -145,7 +140,7 @@ export function parseResultXml(raw: string): ParsedResult {
   ) {
     return {
       status: "unknown",
-      summary: raw.slice(0, 500),
+      summary: raw.trim(),
       findings: "",
       evidence: "",
       confidence: "",

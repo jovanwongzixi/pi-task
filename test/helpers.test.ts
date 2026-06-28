@@ -18,7 +18,7 @@ import {
   chooseTmuxSplitDirection,
   formatBackgroundReceipt,
   TASK_BACKGROUND_DEFAULT,
-  TASK_RESULT_XML_INSTRUCTIONS,
+  TASK_PROMPT_INSTRUCTIONS,
   TASK_TOOL_DESCRIPTION,
   countToolUses,
   readRecentToolCalls,
@@ -85,10 +85,10 @@ import {
 }
 
 {
-  const t = "parseResultXml truncates summary to 500 chars for plain text";
+  const t = "parseResultXml preserves plain text summaries";
   const longText = "x".repeat(600);
   const r = parseResultXml(longText);
-  assert.equal(r.summary.length, 500, t);
+  assert.equal(r.summary, longText, t);
 }
 
 {
@@ -956,17 +956,23 @@ import {
 }
 
 {
-  const t = "XML instructions preserve the required task result tags";
-  for (const tag of ["status", "summary", "findings", "evidence", "files"]) {
-    assert.ok(
-      TASK_RESULT_XML_INSTRUCTIONS.includes(`<${tag}>`),
-      `${t}: has opening ${tag}`,
-    );
-    assert.ok(
-      TASK_RESULT_XML_INSTRUCTIONS.includes(`</${tag}>`),
-      `${t}: has closing ${tag}`,
-    );
-  }
+  const t = "task prompt instructions use JSONL final-message results";
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("final assistant message IS the result"),
+    t + " final message",
+  );
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("session JSONL"),
+    t + " mentions JSONL",
+  );
+  assert.ok(
+    TASK_PROMPT_INSTRUCTIONS.includes("Do not write a RESULT.md file"),
+    t + " avoids result files",
+  );
+  assert.ok(
+    !TASK_PROMPT_INSTRUCTIONS.includes("<summary>"),
+    t + " avoids XML tags",
+  );
 }
 
 console.log("ALL TASK HELPER TESTS PASSED");
