@@ -66,6 +66,27 @@ function tmuxBackend(
   return new TmuxBackend(command) as TmuxBackendContract;
 }
 
+function withEnv<T>(
+  updates: Record<string, string | undefined>,
+  run: () => T,
+): T {
+  const previous = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(updates)) {
+    previous.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+
+  try {
+    return run();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 function layoutResponse(panes: readonly SimulatedHerdrPane[]): string {
   return JSON.stringify({
     result: {
@@ -518,6 +539,157 @@ test("Herdr spawn creates a new task tab for the first task in a wave", () => {
     true,
   );
   assert.equal(calls.some((call) => call[1] === "split"), false);
+});
+
+test("Herdr spawn anchors to the parent env pane instead of the focused workspace", () => {
+  withEnv({ HERDR_PANE_ID: "parent-a" }, () => {
+    const calls: string[][] = [];
+    const backend = herdrBackend((args) => {
+      calls.push(args);
+      if (arrayEqual(args, ["pane", "list"])) {
+        return JSON.stringify({
+          result: {
+            panes: [
+              {
+                pane_id: "parent-a",
+                tab_id: "tab-a",
+                workspace_id: "workspace-a",
+                focused: false,
+              },
+              {
+                pane_id: "focused-b",
+                tab_id: "tab-b",
+                workspace_id: "workspace-b",
+                focused: true,
+              },
+            ],
+          },
+        });
+      }
+      if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-a"])) {
+        return JSON.stringify({ result: { tabs: [] } });
+      }
+      if (args[0] === "tab" && args[1] === "create") {
+        return JSON.stringify({
+          result: {
+            tab: { tab_id: "tab-agents-a", workspace_id: "workspace-a" },
+            root_pane: { pane_id: "agent-root-a", tab_id: "tab-agents-a" },
+          },
+        });
+      }
+      if (args[0] === "pane" && args[1] === "rename") return "";
+      if (
+        arrayEqual(args, ["pane", "run", "agent-root-a", "pi --name first"])
+      ) {
+        return "";
+      }
+      throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+    });
+
+    assert.deepEqual(
+      backend.spawn({ cwd: "/repo-a", command: "pi --name first" }),
+      { paneId: "agent-root-a", originalPane: "parent-a" },
+    );
+    assert.equal(
+      hasCall(calls, [
+        "tab",
+        "create",
+        "--workspace",
+        "workspace-a",
+        "--cwd",
+        "/repo-a",
+        "--label",
+        "Agents 1",
+        "--no-focus",
+      ]),
+      true,
+    );
+    assert.equal(
+      calls.some((call) =>
+        arrayEqual(call, ["tab", "list", "--workspace", "workspace-b"]),
+      ),
+      false,
+    );
+  });
+});
+
+test("Herdr batch spawn anchors to the parent env pane instead of the focused workspace", () => {
+  withEnv({ HERDR_PANE_ID: "parent-a" }, () => {
+    const calls: string[][] = [];
+    const backend = herdrBackend((args) => {
+      calls.push(args);
+      if (arrayEqual(args, ["pane", "list"])) {
+        return JSON.stringify({
+          result: {
+            panes: [
+              {
+                pane_id: "parent-a",
+                tab_id: "tab-a",
+                workspace_id: "workspace-a",
+                focused: false,
+              },
+              {
+                pane_id: "focused-b",
+                tab_id: "tab-b",
+                workspace_id: "workspace-b",
+                focused: true,
+              },
+            ],
+          },
+        });
+      }
+      if (arrayEqual(args, ["tab", "list", "--workspace", "workspace-a"])) {
+        return JSON.stringify({ result: { tabs: [] } });
+      }
+      if (args[0] === "tab" && args[1] === "create") {
+        return JSON.stringify({
+          result: {
+            tab: { tab_id: "tab-agents-a", workspace_id: "workspace-a" },
+            root_pane: { pane_id: "agent-root-a", tab_id: "tab-agents-a" },
+          },
+        });
+      }
+      if (arrayEqual(args, ["pane", "layout", "--pane", "agent-root-a"])) {
+        return layoutResponse([
+          {
+            paneId: "agent-root-a",
+            tabId: "tab-agents-a",
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 40,
+          },
+        ]);
+      }
+      if (args[0] === "pane" && args[1] === "rename") return "";
+      if (args[0] === "pane" && args[1] === "run") return "";
+      throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
+    });
+
+    const result = backend.spawnBatch?.({
+      cwd: "/repo-a",
+      tasks: [{ command: "pi --name first" }],
+    });
+
+    assert.equal(result?.tabId, "tab-agents-a");
+    assert.deepEqual(result?.items, [
+      { paneId: "agent-root-a", originalPane: "parent-a" },
+    ]);
+    assert.equal(
+      hasCall(calls, [
+        "tab",
+        "create",
+        "--workspace",
+        "workspace-a",
+        "--cwd",
+        "/repo-a",
+        "--label",
+        "Agents 1",
+        "--no-focus",
+      ]),
+      true,
+    );
+  });
 });
 
 test("Herdr spawn reuses an active wave tab and splits the largest pane at ratio 0.5", () => {
@@ -1207,13 +1379,13 @@ test("Herdr adopts restored panes into multiple waves and uses the newest as cur
   );
 });
 
-test("Herdr spawn requires a focused pane", () => {
+test("Herdr spawn requires a parent pane", () => {
   const backend = new HerdrBackend(() =>
     JSON.stringify({ result: { panes: [{ pane_id: "unfocused" }] } }),
   );
   assert.throws(
     () => backend.spawn({ cwd: "/repo", command: "pi" }),
-    /focused herdr pane/,
+    /parent herdr pane/,
   );
 });
 

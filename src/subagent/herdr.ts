@@ -47,6 +47,11 @@ interface HerdrWave {
   rootPaneId?: string;
 }
 
+interface HerdrParentPane {
+  paneId: string;
+  workspaceId: string;
+}
+
 function defaultHerdrCommand(args: string[]): string {
   return execFileSync("herdr", args, {
     encoding: "utf-8",
@@ -324,15 +329,9 @@ export class HerdrBackend implements SubagentPaneBackend {
 
   spawn(options: SpawnSubagentOptions): SpawnedSubagentPane {
     const panes = this.listPanes();
-    const focusedPane = panes.find((pane) => pane.focused);
-    const originalPane = focusedPane?.pane_id ?? null;
-    if (!originalPane) {
-      throw new Error("Could not determine the focused herdr pane.");
-    }
-    const workspaceId = focusedPane?.workspace_id;
-    if (!workspaceId) {
-      throw new Error("Focused herdr pane did not include workspace_id.");
-    }
+    const parentPane = this.resolveParentPane(panes);
+    const originalPane = parentPane.paneId;
+    const workspaceId = parentPane.workspaceId;
 
     const wave =
       this.revalidateCurrentWave(panes) ??
@@ -366,15 +365,9 @@ export class HerdrBackend implements SubagentPaneBackend {
     }
 
     const panes = this.listPanes();
-    const focusedPane = panes.find((pane) => pane.focused);
-    const originalPane = focusedPane?.pane_id ?? null;
-    if (!originalPane) {
-      throw new Error("Could not determine the focused herdr pane.");
-    }
-    const workspaceId = focusedPane?.workspace_id;
-    if (!workspaceId) {
-      throw new Error("Focused herdr pane did not include workspace_id.");
-    }
+    const parentPane = this.resolveParentPane(panes);
+    const originalPane = parentPane.paneId;
+    const workspaceId = parentPane.workspaceId;
 
     const tabLabel = boundHerdrLabel(
       options.tabLabel ??
@@ -591,6 +584,24 @@ export class HerdrBackend implements SubagentPaneBackend {
     return parseHerdrTabs(
       this.command(["tab", "list", "--workspace", workspaceId]),
     );
+  }
+
+  private resolveParentPane(panes: readonly HerdrPane[]): HerdrParentPane {
+    const envPaneId = process.env.HERDR_PANE_ID;
+    const envPane =
+      envPaneId && panes.find((pane) => pane.pane_id === envPaneId);
+    const parentPane = envPane || panes.find((pane) => pane.focused);
+    const paneId = parentPane?.pane_id;
+    if (!paneId) {
+      throw new Error("Could not determine the parent herdr pane.");
+    }
+
+    const workspaceId = parentPane.workspace_id;
+    if (!workspaceId) {
+      throw new Error("Parent herdr pane did not include workspace_id.");
+    }
+
+    return { paneId, workspaceId };
   }
 
   private createWave(options: {
