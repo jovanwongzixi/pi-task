@@ -92,6 +92,56 @@ True conversation resume requires a CLI pane backend (`herdr` or `tmux`) so Pi
 can reopen the saved subagent session. The SDK backend can run one-shot tasks,
 but it cannot resume a prior Pi CLI session.
 
+## Forking parent context
+
+`fork_context: true` on `task` (and `task_batch`) forks the main agent's
+current Pi session and gives the subagent the full parent conversation
+history.  It is useful when the subagent needs to continue from the
+parent's context instead of receiving a self-contained prompt.
+
+It requires the parent session to be persisted (i.e., Pi must be saving
+its session to disk).  With `--no-session` or an otherwise unsaved
+session, `fork_context` returns an error.
+
+Examples:
+
+```json
+{
+  "agent_type": "explore",
+  "description": "Continue codebase investigation",
+  "fork_context": true,
+  "prompt": "Look at the auth changes we just discussed and find where the password hashing is configured."
+}
+```
+
+```json
+{
+  "agent_type": "task_batch",
+  "fork_context": true,
+  "tasks": [
+    {
+      "agent_type": "explore",
+      "description": "Investigate auth flow",
+      "prompt": "Using the prior conversation, trace the login flow."
+    },
+    {
+      "agent_type": "reviewer",
+      "description": "Review auth changes",
+      "prompt": "Using the prior conversation, review the recent auth-related edits."
+    }
+  ]
+}
+```
+
+Notes:
+
+- `fork_context` is ignored when `task_id` or `conversation_id` is
+  provided (resume paths take precedence).
+- `tool_uses` and `turn_count` reported in task results only reflect the
+  subagent's own work after the fork, not the parent's history.
+- The subagent still receives `PI_TASK_TOOL_DISABLED=1`, so it cannot
+  recursively call `task`.
+
 ## Backend selection
 
 The optional `backend` field accepts `"auto"`, `"herdr"`, `"tmux"`, or

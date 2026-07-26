@@ -106,6 +106,7 @@ Usage notes:
 6. Clearly tell the agent whether to write code or just research, since it doesn't know the user's intent
 7. The result returned by the agent is not visible to the user. Send a concise summary back to the user
 8. Pass task_id to resume a previous subagent session (continues with its prior context)
+9. Use \`fork_context: true\` when the subagent should continue from the main agent's current conversation history instead of a self-contained prompt. Requires the parent session to be persisted.
 
 Background mode (background: true):
 - Launches the subagent asynchronously and returns immediately
@@ -128,7 +129,8 @@ Usage notes:
 2. Assign the right agent_type per task
 3. Keep descriptions short and distinct so results are easy to identify
 4. Do not duplicate delegated work while the batch runs
-5. Review each completion result before reporting final conclusions to the user`;
+5. Review each completion result before reporting final conclusions to the user
+6. Use \`fork_context: true\` when the subagent should continue from the main agent's current conversation history instead of a self-contained prompt. Requires the parent session to be persisted.`;
 
 /** @deprecated Import from ./agent-tools.js */
 export { ALL_TOOL_NAMES, BUILTIN_TOOL_NAMES } from "./agent-tools.js";
@@ -626,6 +628,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
       resume?: boolean,
       parentToolNames?: string[],
       resumeSessionRef?: string,
+      forkSource?: string,
     ): string[] {
       return buildPiArgv({
         agent,
@@ -635,6 +638,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
         resume,
         resumeSessionRef,
         parentToolNames,
+        forkSource,
       });
     }
 
@@ -643,6 +647,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
     function matchesJsonlSessionName(content: string, sessionName?: string): boolean {
       if (!sessionName) return true;
 
+      let lastMatch = false;
       for (const rawLine of content.split("\n")) {
         const line = rawLine.trim();
         if (!line) continue;
@@ -654,20 +659,21 @@ export function formatAgentList(agents: AgentConfig[]): string {
             session_info?: { name?: string };
           };
           if (entry.type === "session_info") {
-            return (entry.name ?? entry.session_info?.name) === sessionName;
+            lastMatch = (entry.name ?? entry.session_info?.name) === sessionName;
           }
         } catch {
           // Skip malformed lines
         }
       }
 
-      return false;
+      return lastMatch;
     }
     
     /** Count tool uses and turns from pi JSONL session files. */
     export function countToolUses(
       sessionDir: string,
       sessionName?: string,
+      sinceMs?: number,
     ): {
       toolUses: number;
       turns: number;
@@ -689,6 +695,18 @@ export function formatAgentList(agents: AgentConfig[]): string {
     
             try {
               const entry = JSON.parse(line);
+              
+              // Skip entries older than sinceMs
+              if (sinceMs !== undefined) {
+                const entryTs =
+                  typeof entry.timestamp === "string"
+                    ? Date.parse(entry.timestamp)
+                    : typeof entry.message?.timestamp === "number"
+                      ? entry.message.timestamp
+                      : 0;
+                if (entryTs > 0 && entryTs < sinceMs) continue;
+              }
+
               if (
                 entry.type === "message" &&
                 entry.message?.role === "assistant" &&
@@ -777,6 +795,7 @@ export function summarizeArgs(toolName: string, args: unknown): string {
       sessionDir: string,
       limit = 12,
       sessionName?: string,
+      sinceMs?: number,
     ): {
       toolUses: number;
       turns: number;
@@ -813,6 +832,17 @@ export function summarizeArgs(toolName: string, args: unknown): string {
 
         const msg = entry?.message;
         if (!msg || typeof msg !== "object") continue;
+
+        // Skip entries older than sinceMs
+        if (sinceMs !== undefined) {
+          const entryTs =
+            typeof entry.timestamp === "string"
+              ? Date.parse(entry.timestamp)
+              : typeof msg.timestamp === "number"
+                ? msg.timestamp
+                : 0;
+          if (entryTs > 0 && entryTs < sinceMs) continue;
+        }
 
         // Collect tool results first so we can match them to tool calls
         if (msg.role === "toolResult") {

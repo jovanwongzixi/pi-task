@@ -266,6 +266,67 @@ import {
   }
 }
 
+{
+  const t = "countToolUses matches session_info name to filter by session";
+  const dir = mkdtempSync(join(tmpdir(), "task-test-session-info-"));
+  try {
+    const jsonl = [
+      JSON.stringify({ type: "session_info", name: "old-session" }),
+      JSON.stringify({ type: "session_info", name: "new-session" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall" }],
+        },
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "session.jsonl"), jsonl);
+
+    const rNew = countToolUses(dir, "new-session");
+    assert.equal(rNew.toolUses, 1, t + " new-session toolUses");
+    assert.equal(rNew.turns, 1, t + " new-session turns");
+
+    const rOld = countToolUses(dir, "old-session");
+    assert.equal(rOld.toolUses, 0, t + " old-session toolUses");
+    assert.equal(rOld.turns, 0, t + " old-session turns");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const t = "countToolUses filters out entries before sinceMs";
+  const dir = mkdtempSync(join(tmpdir(), "task-test-count-since-"));
+  try {
+    const jsonl = [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall" }],
+        },
+        timestamp: "2024-01-01T00:00:00.000Z",
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall" }, { type: "toolCall" }],
+        },
+        timestamp: "2025-01-01T00:00:00.000Z",
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "session.jsonl"), jsonl);
+
+    const r = countToolUses(dir, undefined, Date.parse("2024-06-01T00:00:00.000Z"));
+    assert.equal(r.toolUses, 2, t + " toolUses");
+    assert.equal(r.turns, 1, t + " turns");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ─── summarizeArgs ──────────────────────────────────────────────────────────
 
 {
@@ -622,6 +683,59 @@ import {
     const r = readRecentToolCalls(dir);
     assert.equal(r.toolUses, 1, t + " toolUses");
     assert.equal(r.recent.length, 1, t + " recent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const t = "readRecentToolCalls filters out entries before sinceMs";
+  const dir = mkdtempSync(join(tmpdir(), "task-test-recent-since-"));
+  try {
+    const jsonl = [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "c1",
+              name: "read",
+              arguments: { path: "/old" },
+            },
+          ],
+        },
+        timestamp: "2024-01-01T00:00:00.000Z",
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "c2",
+              name: "read",
+              arguments: { path: "/a" },
+            },
+            {
+              type: "toolCall",
+              id: "c3",
+              name: "bash",
+              arguments: { command: "ls" },
+            },
+          ],
+        },
+        timestamp: "2025-01-01T00:00:00.000Z",
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "session.jsonl"), jsonl);
+
+    const r = readRecentToolCalls(dir, 12, undefined, Date.parse("2024-06-01T00:00:00.000Z"));
+    assert.equal(r.toolUses, 2, t + " toolUses");
+    assert.equal(r.turns, 1, t + " turns");
+    assert.equal(r.recent.length, 2, t + " recent length");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1169,6 +1283,40 @@ import {
     !TASK_PROMPT_INSTRUCTIONS.includes("<summary>"),
     t + " avoids XML tags",
   );
+}
+
+// ─── findJsonlSessionByName ──────────────────────────────────────────────────
+
+{
+  const t = "findJsonlSessionByName matches the latest session_info entry";
+  const root = mkdtempSync(join(tmpdir(), "task-test-findjsonl-"));
+  try {
+    const piDir = join(root, ".pi");
+    const sessionsDir = join(piDir, "artifacts", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+
+    const { findJsonlSessionByName } = await import("../src/conversation.js");
+
+    const jsonl = [
+      JSON.stringify({ type: "session_info", name: "parent-session" }),
+      JSON.stringify({ type: "session_info", name: "forked-session" }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      }),
+    ].join("\n");
+    writeFileSync(join(sessionsDir, "forked-session.jsonl"), jsonl);
+
+    const found = findJsonlSessionByName(piDir, "forked-session", "explore");
+    assert.ok(found, t + " found");
+    assert.equal(found?.sessionName, "forked-session", t + " name");
+    assert.equal(found?.agentType, "explore", t + " agent type");
+
+    const notFound = findJsonlSessionByName(piDir, "parent-session", "explore");
+    assert.equal(notFound, undefined, t + " parent name should not match latest");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 console.log("ALL TASK HELPER TESTS PASSED");

@@ -116,6 +116,7 @@ export function findJsonlSessionByName(
     for (const file of files) {
       const content = readFileSync(join(sessionDir, file), "utf-8");
       let startedAt = Date.now();
+      let lastSessionInfoName: string | undefined;
       for (const rawLine of content.split("\n")) {
         const line = rawLine.trim();
         if (!line) continue;
@@ -131,27 +132,26 @@ export function findJsonlSessionByName(
             if (Number.isFinite(parsed)) startedAt = parsed;
           }
           if (entry.type === "session_info") {
-            const name = entry.name ?? entry.session_info?.name;
-            if (name === sessionName) {
-              return {
-                id: sessionName,
-                agentType,
-                description: `Resumed session ${sessionName}`,
-                sessionName,
-                sessionRef: join(sessionDir, file),
-                startedAt,
-                piDir,
-                dir: artifactsDir,
-                conversationId: sessionName,
-                status: "done",
-                background: false,
-              };
-            }
-            break;
+            lastSessionInfoName = entry.name ?? entry.session_info?.name;
           }
         } catch {
           // Skip malformed lines.
         }
+      }
+      if (lastSessionInfoName === sessionName) {
+        return {
+          id: sessionName,
+          agentType,
+          description: `Resumed session ${sessionName}`,
+          sessionName,
+          sessionRef: join(sessionDir, file),
+          startedAt,
+          piDir,
+          dir: artifactsDir,
+          conversationId: sessionName,
+          status: "done",
+          background: false,
+        };
       }
     }
   } catch {

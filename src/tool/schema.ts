@@ -28,6 +28,13 @@ export function taskParametersSchema() {
           "Durable specialist conversation id. Reuses .pi/artifacts/task-<id>/sessions when called again.",
       }),
     ),
+    fork_context: Type.Optional(
+      Type.Boolean({
+        description:
+          "Fork the main agent's current session and pass the full conversation history to the subagent. Requires a persisted parent session.",
+        default: false,
+      }),
+    ),
     background: Type.Optional(
       Type.Boolean({
         description:
@@ -93,6 +100,13 @@ export function taskBatchParametersSchema() {
       Type.String({
         description:
           "Optional Herdr tab label for this batch. Ignored by tmux and SDK.",
+      }),
+    ),
+    fork_context: Type.Optional(
+      Type.Boolean({
+        description:
+          "Fork the main agent's current session for every task in this batch. Requires a persisted parent session.",
+        default: false,
       }),
     ),
   });

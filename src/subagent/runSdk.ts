@@ -11,6 +11,12 @@ export interface RunSdkSubagentOptions {
   tools?: string[];
   excludeTools?: string[];
   systemPrompt?: string;
+  /** Path to the parent session file to fork from */
+  forkSource?: string;
+  /** Session name to assign to the forked session */
+  sessionName?: string;
+  /** Session directory for the forked subagent session */
+  sessionDir?: string;
 }
 
 async function resolveModel(ctx: ExtensionContext, requested?: string) {
@@ -47,23 +53,35 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
     throw new Error("No model available for SDK subagent execution");
   }
 
-  const { createAgentSession, DefaultResourceLoader, getAgentDir } =
+  const { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } =
     await import("@earendil-works/pi-coding-agent");
   const previousDisabled = process.env.PI_TASK_TOOL_DISABLED;
   process.env.PI_TASK_TOOL_DISABLED = "1";
   let session: any;
   try {
     const agentDir = getAgentDir();
-    const resourceLoader = new DefaultResourceLoader({
+    const resourceLoaderOptions: Record<string, unknown> = {
       cwd: options.cwd,
       agentDir,
       systemPromptOverride: () => options.systemPrompt,
-      noExtensions: true,
-    } as any);
+    };
+
+    let sessionManager: any;
+    if (options.forkSource) {
+      resourceLoaderOptions.noExtensions = false;
+      sessionManager = SessionManager.forkFrom(options.forkSource, options.cwd, options.sessionDir);
+      if (options.sessionName) {
+        sessionManager.appendSessionInfo(options.sessionName);
+      }
+    } else {
+      resourceLoaderOptions.noExtensions = true;
+    }
+
+    const resourceLoader = new DefaultResourceLoader(resourceLoaderOptions as any);
 
     await resourceLoader.reload();
 
-    ({ session } = await createAgentSession({
+    const sessionOptions: Record<string, unknown> = {
       cwd: options.cwd,
       agentDir,
       model,
@@ -71,7 +89,12 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
       tools: options.tools,
       excludeTools: options.excludeTools,
       resourceLoader,
-    }));
+    };
+    if (sessionManager) {
+      sessionOptions.sessionManager = sessionManager;
+    }
+
+    ({ session } = await createAgentSession(sessionOptions as any));
 
     await session.prompt(options.prompt);
 

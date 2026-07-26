@@ -16,6 +16,7 @@ import {
   sortHerdrLayoutPanesForAssignment,
 } from "../src/subagent/herdr.js";
 import { TmuxBackend } from "../src/subagent/tmux.js";
+import { buildPiArgs } from "../src/helpers.js";
 
 type SubagentOutcome =
   | "completed"
@@ -1507,6 +1508,65 @@ test("Tmux availability requires a current pane", () => {
     }).available(),
     false,
   );
+});
+
+test("buildPiArgs emits --fork and omits --session when forkSource is provided", () => {
+  const agent = {
+    name: "explore",
+    description: "Read-only explorer",
+    body: "You explore.",
+    source: "project" as const,
+    path: "/fake/path",
+  };
+
+  const args = buildPiArgs(
+    agent,
+    "task-fork",
+    "/tmp/sessions",
+    "do work",
+    false,
+    [],
+    undefined,
+    "/tmp/parent.jsonl",
+  );
+
+  const forkIdx = args.indexOf("--fork");
+  assert.ok(forkIdx >= 0, "args contain --fork");
+  assert.equal(args[forkIdx + 1], "/tmp/parent.jsonl", "--fork path matches");
+
+  assert.ok(!args.includes("--session"), "args do not contain --session");
+  assert.ok(args.includes("--name"), "args contain --name");
+  assert.equal(args[args.indexOf("--name") + 1], "task-fork", "--name value matches");
+  assert.ok(args.includes("--session-dir"), "args contain --session-dir");
+  assert.equal(args[args.indexOf("--session-dir") + 1], "/tmp/sessions", "--session-dir value matches");
+  assert.ok(args.includes("--append-system-prompt"), "args contain --append-system-prompt");
+});
+
+test("buildPiArgs emits --session for resume when no forkSource is provided", () => {
+  const agent = {
+    name: "explore",
+    description: "Read-only explorer",
+    body: "You explore.",
+    source: "project" as const,
+    path: "/fake/path",
+  };
+
+  const args = buildPiArgs(
+    agent,
+    "task-resume",
+    "/tmp/sessions",
+    "continue",
+    true,
+    [],
+    undefined,
+    undefined,
+  );
+
+  const sessionIdx = args.indexOf("--session");
+  assert.ok(sessionIdx >= 0, "args contain --session");
+  assert.equal(args[sessionIdx + 1], "task-resume", "--session value matches");
+
+  assert.ok(!args.includes("--fork"), "args do not contain --fork");
 });
 
 test("Tmux spawn targets the current pane and selects split direction", () => {

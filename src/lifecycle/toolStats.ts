@@ -19,6 +19,7 @@ export function startToolStatsPolling(
         sessionDir,
         12,
         task.sessionName,
+        task.startedAt,
       );
       task.toolUses = toolUses;
       task.turns = turns;

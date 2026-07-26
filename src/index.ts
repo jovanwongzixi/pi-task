@@ -220,6 +220,7 @@ export default function (pi: ExtensionAPI) {
     artifactsDir: string;
     parentToolNames: string[];
     ctx: ExtensionContext;
+    forkSource?: string;
   }): Promise<PreparedBatchTask> {
     const id = newTaskId();
     const sessionName = `task-${id}`;
@@ -232,6 +233,7 @@ export default function (pi: ExtensionAPI) {
       agentSource: input.agent.source,
       prompt: input.prompt,
       cwd: input.cwd,
+      forkContext: Boolean(input.forkSource),
     });
     const piArgs = buildPiArgs(
       input.agent,
@@ -240,6 +242,8 @@ export default function (pi: ExtensionAPI) {
       promptContent,
       false,
       input.parentToolNames,
+      undefined,
+      input.forkSource,
     );
     const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((arg) => shellQuote(arg)).join(" ")}`;
     const sessionFile = join(sessionDir, `${sessionName}.jsonl`);
@@ -268,6 +272,9 @@ export default function (pi: ExtensionAPI) {
           tools: toolSelection.tools,
           excludeTools: toolSelection.excludeTools,
           systemPrompt: input.agent.body,
+          forkSource: input.forkSource,
+          sessionName,
+          sessionDir,
         }),
     };
   }
@@ -455,6 +462,33 @@ export default function (pi: ExtensionAPI) {
           },
           isError: true,
         };
+      }
+
+      // ── Fork context: share parent session history ───────────────────
+      let forkSource: string | undefined;
+      if (params.fork_context) {
+        if (params.task_id || params.conversation_id) {
+          // fork_context is ignored when task_id or conversation_id is set
+          // because resume/conversation paths take precedence
+        } else {
+          const parentSessionFile = (ctx.sessionManager as any)?.getSessionFile?.();
+          if (!parentSessionFile) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "fork_context requires a persisted parent session. The current session is not saved to disk (e.g., running with --no-session). Use a regular task with a self-contained prompt instead.",
+                },
+              ],
+              details: {
+                phase: "failed" as const,
+                error: "fork_context requires a persisted parent session",
+              },
+              isError: true,
+            };
+          }
+          forkSource = parentSessionFile;
+        }
       }
 
       // ── Resolve task identity: new, task resume, or conversation resume ──
@@ -753,6 +787,7 @@ export default function (pi: ExtensionAPI) {
             agentSource: agent.source,
             prompt: params.prompt,
             cwd: ctx.cwd,
+            forkContext: Boolean(forkSource),
           });
 
           const sessionDir = join(artifactsDir, "sessions", id);
@@ -767,6 +802,7 @@ export default function (pi: ExtensionAPI) {
         resume,
         parentToolNames,
         resumeSessionRef,
+        forkSource,
       );
       const envPrefix = `PI_TASK_TOOL_DISABLED=1`;
 
@@ -786,6 +822,9 @@ export default function (pi: ExtensionAPI) {
           tools: toolSelection.tools,
           excludeTools: toolSelection.excludeTools,
           systemPrompt: agent.body,
+          forkSource,
+          sessionName,
+          sessionDir,
         });
       const foregroundTask: BackgroundTask | undefined = isBackground
         ? undefined
@@ -1019,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
         const onAbort = () => clearInterval(toolProgressInterval);
         const toolProgressInterval = setInterval(() => {
           try {
-            const stats = countToolUses(sessionDir, sessionName);
+            const stats = countToolUses(sessionDir, sessionName, startedAt);
             if (stats.toolUses > 0 && stats.toolUses !== lastToolCalls) {
               lastToolCalls = stats.toolUses;
               _onUpdate?.({
@@ -1104,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
 
         const parsed = parseResultXml(content);
         const durationMs = Date.now() - startedAt;
-        const { toolUses, turns } = countToolUses(sessionDir, sessionName);
+        const { toolUses, turns } = countToolUses(sessionDir, sessionName, startedAt);
 
             return {
               content: [
@@ -1303,6 +1342,28 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // ── Fork context for batch ───────────────────────────────────────
+      let batchForkSource: string | undefined;
+      if (params.fork_context) {
+        const parentSessionFile = (ctx.sessionManager as any)?.getSessionFile?.();
+        if (!parentSessionFile) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "fork_context requires a persisted parent session. The current session is not saved to disk (e.g., running with --no-session). Use a regular task_batch with self-contained prompts instead.",
+              },
+            ],
+            details: {
+              phase: "failed" as const,
+              error: "fork_context requires a persisted parent session",
+            },
+            isError: true,
+          };
+        }
+        batchForkSource = parentSessionFile;
+      }
+
       const batchId = `batch-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
       const batchLabel =
         typeof params.tab_label === "string" && params.tab_label.trim()
@@ -1325,6 +1386,7 @@ export default function (pi: ExtensionAPI) {
             artifactsDir,
             parentToolNames,
             ctx,
+            forkSource: batchForkSource,
           }),
         ),
       );

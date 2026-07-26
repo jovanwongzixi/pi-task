@@ -18,6 +18,7 @@ function extractText(content: unknown): string {
 function matchesSessionName(content: string, sessionName?: string): boolean {
   if (!sessionName) return true;
 
+  let lastMatch = false;
   for (const rawLine of content.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -28,14 +29,14 @@ function matchesSessionName(content: string, sessionName?: string): boolean {
         session_info?: { name?: string };
       };
       if (entry.type === "session_info") {
-        return (entry.name ?? entry.session_info?.name) === sessionName;
+        lastMatch = (entry.name ?? entry.session_info?.name) === sessionName;
       }
     } catch {
       /* skip malformed JSONL rows */
     }
   }
 
-  return false;
+  return lastMatch;
 }
 
 /**
