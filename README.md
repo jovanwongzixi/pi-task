@@ -116,7 +116,6 @@ Examples:
 
 ```json
 {
-  "agent_type": "task_batch",
   "fork_context": true,
   "tasks": [
     {
