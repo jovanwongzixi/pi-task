@@ -1,6 +1,7 @@
 ---
 description: Post-change code audit specialist. Finds correctness, security, regression, and maintainability issues with file-line evidence.
-model: opencode-go/mimo-v2.5-pro
+model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: high
 disallowed_tools: edit
 prompt_mode: append

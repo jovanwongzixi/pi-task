@@ -146,7 +146,39 @@ test("buildPiArgs produces correct CLI args for fresh explore task", async () =>
   }
 });
 
-// ─── Test 3: BuildPiArgs for resume task ────────────────────────────────────
+// ─── Test 3: BuildPiArgs accepts a resolved provider model override ─────────
+
+test("buildPiArgs uses an explicit model override without mutating the agent", async () => {
+  const { buildPiArgs } = await import("../src/helpers.js");
+  const agent = {
+    name: "explore",
+    description: "Read-only explorer",
+    model: "default/model",
+    modelByProvider: { "openai-codex": "override/model" },
+    body: "You explore.",
+    source: "project" as const,
+    path: "/fake/path",
+  };
+
+  const args = buildPiArgs(
+    agent,
+    "task-model-override",
+    "/tmp/sessions",
+    "do work",
+    false,
+    [],
+    undefined,
+    undefined,
+    "override/model",
+  );
+
+  const modelIdx = args.indexOf("--model");
+  assert.ok(modelIdx >= 0, "args contain --model");
+  assert.equal(args[modelIdx + 1], "override/model");
+  assert.equal(agent.model, "default/model");
+});
+
+// ─── Test 4: BuildPiArgs for resume task ────────────────────────────────────
 
 test("buildPiArgs includes --session for resume explore task", async () => {
   const { root, agentsDir, sessionsDir } = createFixture();
@@ -171,7 +203,7 @@ test("buildPiArgs includes --session for resume explore task", async () => {
   }
 });
 
-// ─── Test 4: Agent tool resolution for explore ──────────────────────────────
+// ─── Test 5: Agent tool resolution for explore ──────────────────────────────
 
 test("resolveAgentToolAllowlist correctly filters explore agent tools", async () => {
   const { resolveAgentToolAllowlist } = await import("../src/agent-tools.js");
@@ -195,7 +227,7 @@ test("resolveAgentToolAllowlist correctly filters explore agent tools", async ()
   assert.deepEqual(explicitTools, ["read", "bash", "grep"]);
 });
 
-// ─── Test 5: Backend selection for explore tasks ───────────────────────────
+// ─── Test 6: Backend selection for explore tasks ───────────────────────────
 
 test("selectSubagentBackend prefers herdr > tmux > sdk", async () => {
   const { selectSubagentBackend } = await import("../src/subagent/backend.js");

@@ -1,6 +1,7 @@
 ---
 description: Read-only codebase cartographer. Finds files, symbols, usage patterns, and call paths without modifying anything.
 model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: off
 disallowed_tools: edit
 prompt_mode: append

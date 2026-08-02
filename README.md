@@ -16,7 +16,7 @@ For the full high-quality 89s @ 56 fps version, [download the MP4](https://githu
 - Background tasks: parent continues, task widget shows progress, completion arrives as a follow-up.
 - Herdr and tmux backends for observable subagent panes.
 - Pi SDK fallback for headless environments without an available pane backend.
-- Agent frontmatter support: `model`, `thinking`, `tools`, `disallowed_tools`.
+- Agent frontmatter support: `model`, provider-specific `model_by_provider`, `thinking`, `tools`, `disallowed_tools`.
 - Built-in starter agents: `scout`, `explore`, `planner`, `reviewer`, `vision`, `worker`.
 - Project/user agent overrides via `.pi/agents/*.md` or `~/.pi/agents/*.md`.
 
@@ -172,6 +172,7 @@ When two agents have the same name, later sources override earlier ones:
 ---
 description: Local read-only code explorer
 model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: off
 tools: read, grep, find, ls
 disallowed_tools: edit, write
@@ -180,6 +181,8 @@ prompt_mode: append
 
 # Agent instructions
 ```
+
+`model_by_provider:` is an optional flat inline JSON object keyed by the parent Pi provider. Its matching model takes precedence over `model`; invalid JSON, non-object values, and non-string entries fall back to the default `model`.
 
 `tools:` is an explicit allowlist. If omitted, pi-task starts from the tools actually registered in the parent Pi session, then removes `disallowed_tools`. Recursive `task` delegation is always blocked.
 

@@ -32,6 +32,7 @@ import {
   validateTaskBatchTasks,
   findPiDir,
   loadAgentsFromDir,
+  resolveAgentModel,
   discoverAgents,
   formatAgentList,
   type AgentConfig,
@@ -799,6 +800,7 @@ import {
         "---",
         "description: Read-only codebase explorer",
         "model: gpt-4o",
+        "model_by_provider: {\"openai-codex\":\"openai-codex/gpt-5.6-luna\"}",
         "tools: read, grep",
         "disallowed_tools: edit, write",
         "---",
@@ -831,6 +833,11 @@ import {
       t + " description",
     );
     assert.equal(explore!.model, "gpt-4o", t + " model");
+    assert.deepEqual(
+      explore!.modelByProvider,
+      { "openai-codex": "openai-codex/gpt-5.6-luna" },
+      t + " model by provider",
+    );
     assert.ok(
       explore!.disallowedTools?.includes("edit"),
       t + " disallowed edit",
@@ -896,6 +903,65 @@ import {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+{
+  const t = "loadAgentsFromDir ignores invalid model_by_provider values";
+  const dir = mkdtempSync(join(tmpdir(), "task-test-agents-model-map-"));
+  try {
+    writeFileSync(
+      join(dir, "invalid.md"),
+      [
+        "---",
+        "description: Invalid model map",
+        "model: default-model",
+        "model_by_provider: [\"not-an-object\"]",
+        "---",
+        "Body.",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(dir, "mixed.md"),
+      [
+        "---",
+        "description: Mixed model map",
+        "model: mixed-default",
+        "model_by_provider: {\"valid\":\"valid-model\",\"invalid\":42}",
+        "---",
+        "Body.",
+      ].join("\n"),
+    );
+
+    const agents = loadAgentsFromDir(dir, "project");
+    assert.equal(
+      agents.find((agent) => agent.name === "invalid")?.modelByProvider,
+      undefined,
+      t,
+    );
+    assert.deepEqual(
+      agents.find((agent) => agent.name === "mixed")?.modelByProvider,
+      { valid: "valid-model" },
+      t + " valid entries",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const t = "resolveAgentModel prefers matching provider override and falls back";
+  const agent = {
+    model: "default-model",
+    modelByProvider: { "openai-codex": "codex-model" },
+  };
+  assert.equal(resolveAgentModel(agent, "openai-codex"), "codex-model", t);
+  assert.equal(resolveAgentModel(agent, "anthropic"), "default-model", t);
+  assert.equal(resolveAgentModel(agent), "default-model", t);
+  assert.equal(
+    resolveAgentModel({ modelByProvider: { "openai-codex": "codex-model" } }, "anthropic"),
+    undefined,
+    t + " without default",
+  );
 }
 
 // ─── formatAgentList ─────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 ---
 description: Planning and architecture specialist. Produces implementation plans, risk analysis, and acceptance criteria. Does not edit files.
-model: opencode-go/mimo-v2.5-pro
+model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: high
 max_turns: 40
 disallowed_tools: edit

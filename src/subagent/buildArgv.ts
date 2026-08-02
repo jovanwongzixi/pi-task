@@ -10,6 +10,8 @@ export interface BuildPiArgvOptions {
   sessionName: string;
   sessionDir: string;
   promptContent: string;
+  /** Explicit resolved model; falls back to the agent's default model. */
+  modelOverride?: string;
   resume?: boolean;
   resumeSessionRef?: string;
   parentToolNames?: string[];
@@ -26,7 +28,8 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
   });
 
   const args: string[] = [];
-  if (agent.model) args.push("--model", agent.model);
+  const model = opts.modelOverride ?? agent.model;
+  if (model) args.push("--model", model);
   if (agent.thinking) args.push("--thinking", agent.thinking);
   args.push("--tools", allowedTools.join(","));
   args.push("--name", sessionName);

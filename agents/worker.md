@@ -1,7 +1,8 @@
 ---
 description: Focused implementation agent. Makes small scoped code changes, runs checks, and reports exact files changed.
 model: opencode-go/deepseek-v4-flash
-thinking: high
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
+thinking: xhigh
 prompt_mode: append
 ---
 

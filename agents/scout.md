@@ -1,6 +1,7 @@
 ---
 description: External research specialist. Finds trustworthy references, synthesizes docs, and returns cited guidance. Memory-first.
 model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: off
 disallowed_tools: edit
 prompt_mode: append

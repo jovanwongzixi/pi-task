@@ -1,6 +1,7 @@
 ---
 description: UI/UX visual review specialist. Audits screenshots or UI code for hierarchy, layout, accessibility, and design-system consistency.
-model: opencode-go/mimo-v2.5-pro
+model: opencode-go/deepseek-v4-flash
+model_by_provider: {"openai-codex":"openai-codex/gpt-5.6-luna"}
 thinking: high
 max_turns: 35
 disallowed_tools: edit

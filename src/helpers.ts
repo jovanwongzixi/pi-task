@@ -44,6 +44,8 @@ export interface AgentConfig {
   name: string;
   description: string;
   model?: string;
+  /** Provider-specific model overrides from frontmatter `model_by_provider:`. */
+  modelByProvider?: Record<string, string>;
   thinking?: string;
   /** Explicit allowlist from frontmatter `tools:` */
   tools?: string | string[];
@@ -502,6 +504,44 @@ export function formatTaskBatchDetails(
 
 // ─── Agent Discovery ─────────────────────────────────────────────────────────
 
+function parseModelByProvider(
+  raw: string | undefined,
+): Record<string, string> | undefined {
+  if (!raw) return undefined;
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPlainRecord(parsed)) return undefined;
+
+    const modelByProvider: Record<string, string> = {};
+    for (const [provider, model] of Object.entries(parsed)) {
+      const normalizedProvider = provider.trim();
+      const normalizedModel = typeof model === "string" ? model.trim() : "";
+      if (normalizedProvider && normalizedModel) {
+        modelByProvider[normalizedProvider] = normalizedModel;
+      }
+    }
+    return Object.keys(modelByProvider).length > 0
+      ? modelByProvider
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve an agent's model override for the parent provider, if present. */
+export function resolveAgentModel(
+  agent: Pick<AgentConfig, "model" | "modelByProvider">,
+  parentProvider?: string,
+): string | undefined {
+  const override = parentProvider
+    ? agent.modelByProvider?.[parentProvider]
+    : undefined;
+  return typeof override === "string" && override.trim().length > 0
+    ? override
+    : agent.model;
+}
+
 export function findPiDir(cwd: string): string | null {
   let current = resolve(cwd);
   while (true) {
@@ -562,6 +602,7 @@ export function loadAgentsFromDir(
       name,
       description: frontmatter.description,
       model: frontmatter.model,
+      modelByProvider: parseModelByProvider(frontmatter.model_by_provider),
       thinking: frontmatter.thinking,
       tools: tools.length > 0 ? tools : undefined,
       disallowedTools,
@@ -629,12 +670,14 @@ export function formatAgentList(agents: AgentConfig[]): string {
       parentToolNames?: string[],
       resumeSessionRef?: string,
       forkSource?: string,
+      modelOverride?: string,
     ): string[] {
       return buildPiArgv({
         agent,
         sessionName,
         sessionDir,
         promptContent,
+        modelOverride,
         resume,
         resumeSessionRef,
         parentToolNames,

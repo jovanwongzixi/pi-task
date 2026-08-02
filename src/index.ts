@@ -58,6 +58,7 @@ import {
   formatTaskBatchDetails,
   formatTaskBatchReceipt,
   parseResultXml,
+  resolveAgentModel,
   shellQuote,
   validateTaskBatchTasks,
   type AgentConfig,
@@ -111,6 +112,17 @@ const paneBackends: readonly SubagentPaneBackend[] = [
   herdrBackend,
   tmuxBackend,
 ];
+
+function getParentProvider(ctx: Pick<ExtensionContext, "model">): string | undefined {
+  const provider = (ctx.model as { provider?: unknown } | undefined)?.provider;
+  if (typeof provider === "string") return provider;
+  if (provider && typeof provider === "object") {
+    const id = (provider as { id?: unknown }).id;
+    return typeof id === "string" ? id : undefined;
+  }
+  return undefined;
+}
+
 // Conversation helpers live in ./conversation.js.
 
 // ─── Extension Entry Point ──────────────────────────────────────────────────
@@ -235,6 +247,10 @@ export default function (pi: ExtensionAPI) {
       cwd: input.cwd,
       forkContext: Boolean(input.forkSource),
     });
+    const resolvedModel = resolveAgentModel(
+      input.agent,
+      getParentProvider(input.ctx),
+    );
     const piArgs = buildPiArgs(
       input.agent,
       sessionName,
@@ -244,6 +260,7 @@ export default function (pi: ExtensionAPI) {
       input.parentToolNames,
       undefined,
       input.forkSource,
+      resolvedModel,
     );
     const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((arg) => shellQuote(arg)).join(" ")}`;
     const sessionFile = join(sessionDir, `${sessionName}.jsonl`);
@@ -267,7 +284,7 @@ export default function (pi: ExtensionAPI) {
           agent: input.agent,
           cwd: input.cwd,
           ctx: input.ctx,
-          model: input.agent.model,
+          model: resolvedModel,
           thinkingLevel: input.agent.thinking,
           tools: toolSelection.tools,
           excludeTools: toolSelection.excludeTools,
@@ -463,6 +480,8 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
+
+      const resolvedModel = resolveAgentModel(agent, getParentProvider(ctx));
 
       // ── Fork context: share parent session history ───────────────────
       let forkSource: string | undefined;
@@ -803,6 +822,7 @@ export default function (pi: ExtensionAPI) {
         parentToolNames,
         resumeSessionRef,
         forkSource,
+        resolvedModel,
       );
       const envPrefix = `PI_TASK_TOOL_DISABLED=1`;
 
@@ -817,7 +837,7 @@ export default function (pi: ExtensionAPI) {
           agent,
           cwd: ctx.cwd,
           ctx,
-          model: agent.model,
+          model: resolvedModel,
           thinkingLevel: agent.thinking,
           tools: toolSelection.tools,
           excludeTools: toolSelection.excludeTools,
