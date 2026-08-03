@@ -41,11 +41,12 @@ import {
   readRegistry,
   readTaskSessionsRegistry,
   renderConversationSessions,
+  updateRegistry,
   upsertTaskSessionHistory,
   writeConversationArtifacts,
-  writeRegistry,
   writeTaskSessionsRegistry,
 } from "./conversation.js";
+import { currentTaskOwner, isAdoptable, stampOwner } from "./ownership.js";
 import {
   TASK_BATCH_TOOL_DESCRIPTION,
   TASK_BACKGROUND_DEFAULT,
@@ -133,6 +134,11 @@ export default function (pi: ExtensionAPI) {
 
   // ── Background task tracker ────────────────────────────────────────────
       const { piDir } = discoverAgents(process.cwd(), BUNDLED_AGENT_DIR);
+      // Identity of this pi process. The task registry lives in the resolved
+      // `.pi` dir, which several workspaces can share (commonly `~/.pi`), so
+      // every entry we write is stamped with this owner and we only ever
+      // restore, poll and complete tasks that belong to us.
+      const taskOwner = currentTaskOwner(process.cwd());
       const backgroundTasks = new Map<string, BackgroundTask>();
       const foregroundTasks = new Map<string, BackgroundTask>();
   const taskWidget = createTaskWidgetController(foregroundTasks, backgroundTasks);
@@ -140,7 +146,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Restore active tasks from registry on load ──────────────────────────
 
-  restoreActiveBackgroundTasks(piDir, backgroundTasks, paneBackends);
+  restoreActiveBackgroundTasks(piDir, backgroundTasks, paneBackends, taskOwner);
 
 
   // ── Widget / timer setup ───────────────────────────────────────────────
@@ -328,25 +334,26 @@ export default function (pi: ExtensionAPI) {
     };
     backgroundTasks.set(input.prepared.id, task);
 
-    const entry: RegistryEntry = {
-      id: input.prepared.id,
-      agentType: input.prepared.agentType,
-      description: input.prepared.description,
-      sessionName: input.prepared.sessionName,
-      startedAt,
-      paneId: input.paneId,
-      piDir: input.piDir,
-      dir: input.artifactsDir,
-      backend: input.backend,
-      batchId: input.batchId,
-      batchLabel: input.batchLabel,
-      batchIndex: input.batchIndex,
-      batchSize: input.batchSize,
-    };
+    const entry: RegistryEntry = stampOwner(
+      {
+        id: input.prepared.id,
+        agentType: input.prepared.agentType,
+        description: input.prepared.description,
+        sessionName: input.prepared.sessionName,
+        startedAt,
+        paneId: input.paneId,
+        piDir: input.piDir,
+        dir: input.artifactsDir,
+        backend: input.backend,
+        batchId: input.batchId,
+        batchLabel: input.batchLabel,
+        batchIndex: input.batchIndex,
+        batchSize: input.batchSize,
+      },
+      taskOwner,
+    );
 
-    const entries = readRegistry(input.piDir);
-    entries.push(entry);
-    writeRegistry(input.piDir, entries);
+    updateRegistry(input.piDir, (entries) => [...entries, entry]);
     upsertTaskSessionHistory(input.piDir, {
       ...entry,
       status: "running",
@@ -384,9 +391,8 @@ export default function (pi: ExtensionAPI) {
         if (!backgroundTasks.delete(id)) return;
         finalizeBatchTaskPane(task);
         clearTaskWidgetIfIdle();
-        writeRegistry(
-          taskPiDir,
-          readRegistry(taskPiDir).filter((candidate) => candidate.id !== id),
+        updateRegistry(taskPiDir, (entries) =>
+          entries.filter((candidate) => candidate.id !== id),
         );
         upsertTaskSessionHistory(taskPiDir, {
           ...entry,
@@ -570,8 +576,11 @@ export default function (pi: ExtensionAPI) {
         }
         resume = true;
 
+        // Only reattach to a live pane we own — a task still running under
+        // another pi process must keep reporting to that process.
         const entry = readRegistry(piDir).find(
-          (candidate) => candidate.id === id,
+          (candidate) =>
+            candidate.id === id && isAdoptable(candidate, taskOwner),
         );
         if (
           params.background !== false &&
@@ -678,10 +687,12 @@ export default function (pi: ExtensionAPI) {
          resume = true;
          resumeSessionRef = entry.sessionRef;
 
-        // If background and pane still alive, reattach to tracker
+        // If background and pane still alive, reattach to tracker — but never
+        // to a task another live pi process is still tracking.
         if (
           params.background !== false &&
           entry.paneId &&
+          isAdoptable(entry, taskOwner) &&
           paneIsAlive(entry.backend ?? "tmux", entry.paneId)
         ) {
           const bgtask: BackgroundTask = {
@@ -887,21 +898,22 @@ export default function (pi: ExtensionAPI) {
           };
 
           backgroundTasks.set(id, bgtask);
-          const entry: RegistryEntry = {
-            id,
-            agentType: agent.name,
-            description: descText,
-            sessionName,
-            startedAt: bgtask.startedAt,
-            piDir,
-            dir: artifactsDir,
-            conversationId,
-            backend: "sdk",
-          };
+          const entry: RegistryEntry = stampOwner(
+            {
+              id,
+              agentType: agent.name,
+              description: descText,
+              sessionName,
+              startedAt: bgtask.startedAt,
+              piDir,
+              dir: artifactsDir,
+              conversationId,
+              backend: "sdk",
+            },
+            taskOwner,
+          );
 
-          const entries = readRegistry(piDir);
-          entries.push(entry);
-          writeRegistry(piDir, entries);
+          updateRegistry(piDir, (entries) => [...entries, entry]);
           upsertTaskSessionHistory(piDir, {
             ...entry,
             status: "running",
@@ -1214,23 +1226,24 @@ export default function (pi: ExtensionAPI) {
       backgroundTasks.set(id, bgtask);
 
       // ── P0: Persistent registry ────────────────────────────────────────
-      const entry: RegistryEntry = {
-        id,
-        agentType: agent.name,
-        description: descText,
-        sessionName,
-        startedAt: bgtask.startedAt,
-        paneId,
-        piDir,
-        dir: artifactsDir,
-        conversationId,
-        backend: backendSelection.name,
-      };
+      const entry: RegistryEntry = stampOwner(
+        {
+          id,
+          agentType: agent.name,
+          description: descText,
+          sessionName,
+          startedAt: bgtask.startedAt,
+          paneId,
+          piDir,
+          dir: artifactsDir,
+          conversationId,
+          backend: backendSelection.name,
+        },
+        taskOwner,
+      );
 
       // Write to JSON registry for on-load restore
-      const entries = readRegistry(piDir);
-      entries.push(entry);
-      writeRegistry(piDir, entries);
+      updateRegistry(piDir, (entries) => [...entries, entry]);
       upsertTaskSessionHistory(piDir, {
         ...entry,
         status: "running",
@@ -1248,8 +1261,9 @@ export default function (pi: ExtensionAPI) {
             backgroundTasks.delete(id);
             clearTaskWidgetIfIdle();
             // Clean registry
-            const remaining = readRegistry(piDir).filter((e) => e.id !== id);
-            writeRegistry(piDir, remaining);
+            updateRegistry(piDir, (entries) =>
+              entries.filter((e) => e.id !== id),
+            );
                 clearTaskWidgetIfIdle();
           },
           { once: true },

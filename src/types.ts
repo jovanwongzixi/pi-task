@@ -39,6 +39,12 @@ export interface RegistryEntry {
   conversationId?: string;
   sessionRef?: string;
   backend?: TaskBackendName;
+  /** PID of the pi process that spawned this task (see ./ownership.ts). */
+  ownerPid?: number;
+  /** Start time of that process, in epoch ms; guards against PID reuse. */
+  ownerStartedAt?: number;
+  /** Resolved cwd of the pi session that spawned this task. */
+  ownerCwd?: string;
   batchId?: string;
   batchLabel?: string;
   batchIndex?: number;

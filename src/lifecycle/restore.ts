@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { readRegistry, writeRegistry } from "../conversation.js";
+import { readRegistry, updateRegistry } from "../conversation.js";
+import { classifyOwnership, type TaskOwner } from "../ownership.js";
 import type { SubagentPaneBackend } from "../subagent/backend.js";
 import type { BackgroundTask, TaskBackendName } from "../types.js";
 
@@ -11,21 +12,33 @@ function getPaneBackend(
   return backends.find((backend) => backend.name === (backendName ?? "tmux"));
 }
 
+/**
+ * Adopt this session's in-flight background tasks from the registry.
+ *
+ * The registry file can be shared with other workspaces (see ../ownership.ts),
+ * so entries owned by another live pi process are skipped entirely: not
+ * restored — restoring them would make this session deliver their results —
+ * and not pruned either, since only their owner can tell whether they are
+ * stale.
+ */
 export function restoreActiveBackgroundTasks(
   piDir: string,
   backgroundTasks: Map<string, BackgroundTask>,
   paneBackends: readonly SubagentPaneBackend[] = [],
+  owner?: TaskOwner,
 ): void {
   const registry = readRegistry(piDir);
-  const staleIds: string[] = [];
+  const staleIds = new Set<string>();
   const restoredByBackend = new Map<
     string,
     { paneId: string; startedAt: number }[]
   >();
 
   for (const entry of registry) {
+    if (owner && classifyOwnership(entry, owner) === "foreign") continue;
+
     if (!existsSync(entry.dir)) {
-      staleIds.push(entry.id);
+      staleIds.add(entry.id);
       continue;
     }
 
@@ -36,7 +49,7 @@ export function restoreActiveBackgroundTasks(
         ? (paneBackend?.exists(entry.paneId) ?? false)
         : false;
     if (!paneAlive) {
-      staleIds.push(entry.id);
+      staleIds.add(entry.id);
       continue;
     }
 
@@ -70,10 +83,11 @@ export function restoreActiveBackgroundTasks(
     backend.adoptRestoredPanes?.(restoredByBackend.get(backend.name) ?? []);
   }
 
-  if (staleIds.length) {
-    writeRegistry(
-      piDir,
-      registry.filter((entry) => !staleIds.includes(entry.id)),
+  // Prune only entries we are entitled to own; re-read under the lock so a
+  // task another session registered while we were scanning survives.
+  if (staleIds.size) {
+    updateRegistry(piDir, (entries) =>
+      entries.filter((entry) => !staleIds.has(entry.id)),
     );
   }
 }

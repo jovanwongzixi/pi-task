@@ -1,9 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   findJsonlSessionByName,
-  readRegistry,
+  updateRegistry,
   upsertTaskSessionHistory,
-  writeRegistry,
 } from "../conversation.js";
 import { parseResultXml } from "../helpers.js";
 import type {
@@ -122,6 +121,5 @@ export function completeTask(
     },
   );
 
-  const entries = readRegistry(piDir).filter((entry) => entry.id !== id);
-  writeRegistry(piDir, entries);
+  updateRegistry(piDir, (entries) => entries.filter((entry) => entry.id !== id));
 }

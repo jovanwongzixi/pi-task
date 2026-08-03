@@ -1,4 +1,13 @@
-    import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+    import {
+      existsSync,
+      mkdirSync,
+      readdirSync,
+      readFileSync,
+      renameSync,
+      rmSync,
+      statSync,
+      writeFileSync,
+    } from "node:fs";
     import { join } from "node:path";
     import type { RegistryEntry, TaskSessionHistoryEntry } from "./types.js";
 
@@ -45,49 +54,148 @@ export function getTaskSessionsRegistryPath(piDir: string): string {
   return join(piDir, "artifacts", TASK_SESSIONS_REGISTRY_FILE);
 }
 
-export function readRegistry(piDir: string): RegistryEntry[] {
-  const path = join(piDir, "task-registry.json");
+export function getRegistryPath(piDir: string): string {
+  return join(piDir, "task-registry.json");
+}
+
+export function getTaskSessionHistoryPath(piDir: string): string {
+  return join(piDir, "task-session-history.json");
+}
+
+function readJsonArray<T>(path: string): T[] {
   try {
-    return JSON.parse(readFileSync(path, "utf-8"));
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
   }
+}
+
+/** Write via temp file + rename so a concurrent reader never sees a partial file. */
+function writeJsonAtomic(path: string, value: unknown): void {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // best effort
+    }
+    throw error;
+  }
+}
+
+/**
+ * Read-modify-write under a directory lock.
+ *
+ * The registry files are shared by every pi session that resolves to the same
+ * `.pi` directory, so a plain read-then-write loses entries whenever two
+ * sessions start or finish a task at the same time. `mkdir` is atomic on every
+ * platform we support; the lock is held for the duration of a small JSON
+ * rewrite, so a short spin is cheaper than going async.
+ */
+const LOCK_TIMEOUT_MS = 2_000;
+const LOCK_STALE_MS = 10_000;
+const LOCK_RETRY_MS = 5;
+
+/** Blocking sleep — the lock is synchronous by necessity. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withFileLock<T>(path: string, mutate: () => T): T {
+  const lock = `${path}.lock`;
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let held = false;
+
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(lock);
+      held = true;
+      break;
+    } catch {
+      // Break a lock left behind by a crashed process.
+      try {
+        const age = Date.now() - statSync(lock).mtimeMs;
+        if (age > LOCK_STALE_MS) rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // lock vanished; retry
+      }
+      sleepSync(LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return mutate();
+  } finally {
+    if (held) {
+      try {
+        rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  }
+}
+
+export function readRegistry(piDir: string): RegistryEntry[] {
+  return readJsonArray<RegistryEntry>(getRegistryPath(piDir));
 }
 
 export function writeRegistry(piDir: string, entries: RegistryEntry[]): void {
-  const path = join(piDir, "task-registry.json");
-  writeFileSync(path, JSON.stringify(entries, null, 2), "utf-8");
+  const path = getRegistryPath(piDir);
+  withFileLock(path, () => writeJsonAtomic(path, entries));
+}
+
+/**
+ * Apply `mutate` to the registry while holding the lock. Prefer this over
+ * `readRegistry` + `writeRegistry`: it is the only way to add or remove a
+ * single entry without clobbering entries written by another pi session in
+ * between the read and the write.
+ */
+export function updateRegistry(
+  piDir: string,
+  mutate: (entries: RegistryEntry[]) => RegistryEntry[],
+): RegistryEntry[] {
+  const path = getRegistryPath(piDir);
+  return withFileLock(path, () => {
+    const next = mutate(readJsonArray<RegistryEntry>(path));
+    writeJsonAtomic(path, next);
+    return next;
+  });
 }
 
 export function readTaskSessionHistory(piDir: string): TaskSessionHistoryEntry[] {
-  const path = join(piDir, "task-session-history.json");
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return [];
-  }
+  return readJsonArray<TaskSessionHistoryEntry>(
+    getTaskSessionHistoryPath(piDir),
+  );
 }
 
 export function writeTaskSessionHistory(
   piDir: string,
   entries: TaskSessionHistoryEntry[],
 ): void {
-  const path = join(piDir, "task-session-history.json");
-  writeFileSync(path, JSON.stringify(entries, null, 2), "utf-8");
+  const path = getTaskSessionHistoryPath(piDir);
+  withFileLock(path, () => writeJsonAtomic(path, entries));
 }
 
 export function upsertTaskSessionHistory(
   piDir: string,
   entry: TaskSessionHistoryEntry,
 ): void {
-  const entries = readTaskSessionHistory(piDir);
-  const index = entries.findIndex((existing) => existing.id === entry.id);
-  if (index >= 0) {
-    entries[index] = { ...entries[index], ...entry };
-  } else {
-    entries.push(entry);
-  }
-  writeTaskSessionHistory(piDir, entries);
+  const path = getTaskSessionHistoryPath(piDir);
+  withFileLock(path, () => {
+    const entries = readJsonArray<TaskSessionHistoryEntry>(path);
+    const index = entries.findIndex((existing) => existing.id === entry.id);
+    if (index >= 0) {
+      entries[index] = { ...entries[index], ...entry };
+    } else {
+      entries.push(entry);
+    }
+    writeJsonAtomic(path, entries);
+  });
 }
 
 export function findTaskSessionHistory(

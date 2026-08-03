@@ -24,6 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Durable conversation resume now supports either CLI pane backend (Herdr or
   tmux); SDK tasks remain one-shot and do not resume saved Pi CLI sessions.
 
+### Fixed
+
+- **Completed subagents no longer report to the wrong Pi session.** The task
+  registry lives in the resolved `.pi` directory, which is found by walking up
+  from the cwd — so every workspace without its own `.pi` shared one
+  `~/.pi/task-registry.json`. Entries carried no owner, so any session that
+  loaded the extension restored, polled and completed *every* task in that
+  file, delivering the result into whichever session adopted it first (and
+  deleting the entry the real owner needed). Registry entries are now stamped
+  with the spawning Pi process (`ownerPid`, `ownerStartedAt`, `ownerCwd`, see
+  `src/ownership.ts`), and restore/resume only adopt tasks owned by this
+  process or orphaned by a dead process in the same workspace.
+- **Stale-entry cleanup no longer deletes other sessions' tasks.** Restore
+  prunes only entries it is entitled to own.
+- **Registry writes are atomic and locked.** `updateRegistry()` performs
+  read-modify-write under a lock file and writes via temp file + rename, so
+  two Pi sessions starting or finishing tasks at the same time can no longer
+  lose each other's entries or read a half-written file.
+
 ## [0.2.0] — 2026-06-25
 
 ### Changed
