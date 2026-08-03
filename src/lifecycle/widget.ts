@@ -4,6 +4,7 @@ import { formatMs } from "../helpers.js";
 import {
   TASK_WIDGET_RENDER_MS,
   renderTaskWidget,
+  sanitizeWidgetText,
   type ThemeLike,
 } from "../task-widget.js";
 import type { BackgroundTask } from "../types.js";
@@ -49,7 +50,7 @@ export function createTaskWidgetController(
       const [, task] = active[0]!;
       return [
         truncateToWidth(
-          `${task.agentType}  • ${formatMs(Date.now() - task.startedAt)}  (render error: ${msg})`,
+          `${sanitizeWidgetText(task.agentType)}  • ${formatMs(Date.now() - task.startedAt)}  (render error: ${sanitizeWidgetText(msg)})`,
           Math.min(width, 120),
         ),
       ];

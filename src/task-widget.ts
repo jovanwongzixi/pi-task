@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { ToolCallRecord } from "./helpers.js";
 import { formatMs } from "./helpers.js";
@@ -31,6 +32,21 @@ const MAX_BACKGROUND_LINES = 8;
 const MAX_WIDTH = 120;
 const TREE_MIDDLE = "\u251C\u2500"; // ├─
 const TREE_LAST = "\u2514\u2500"; // └─
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]+/g;
+
+/** Convert session- and user-sourced values into safe single-line widget text. */
+export function sanitizeWidgetText(text: string): string {
+  return stripVTControlCharacters(text)
+    .replace(CONTROL_CHARACTERS, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateWidgetLine(line: string, maxWidth: number): string {
+  // Theme functions may add ANSI codes, so enforce the line invariant without
+  // stripping valid styling after dynamic values have already been sanitized.
+  return truncateToWidth(line.replace(/[\r\n]+/g, " "), maxWidth);
+}
 
 function color(
   theme: ThemeLike | null | undefined,
@@ -70,10 +86,12 @@ function formatLatestTool(
     return `${toolStatusMark(theme, "in_progress", spinner)} ${color(theme, "dim", "waiting")}`;
   }
 
-  const detail = latest.detail ? ` ${latest.detail}` : "";
+  const latestName = sanitizeWidgetText(latest.name);
+  const latestDetail = sanitizeWidgetText(latest.detail);
+  const detail = latestDetail ? ` ${latestDetail}` : "";
   return (
     `${toolStatusMark(theme, latest.status, spinner)} ` +
-    color(theme, "text", latest.name) +
+    color(theme, "text", latestName) +
     color(theme, "dim", detail)
   );
 }
@@ -85,10 +103,12 @@ function renderForegroundTask(
   spinner: string,
   theme: ThemeLike | null | undefined,
 ): string[] {
+  const safeAgentType = sanitizeWidgetText(task.agentType);
   const agentName =
-    task.agentType.charAt(0).toUpperCase() + task.agentType.slice(1);
+    safeAgentType.charAt(0).toUpperCase() + safeAgentType.slice(1);
   const elapsed = formatMs(now - task.startedAt);
-  const description = task.description ? ` — ${task.description}` : "";
+  const safeDescription = sanitizeWidgetText(task.description ?? "");
+  const description = safeDescription ? ` — ${safeDescription}` : "";
   const lines: string[] = [];
 
   const header =
@@ -102,22 +122,24 @@ function renderForegroundTask(
       ? color(theme, "dim", " \u2022 ") +
         color(theme, "success", formatToolCount(task.toolUses))
       : "");
-  lines.push(truncateToWidth(header, maxWidth));
+  lines.push(truncateWidgetLine(header, maxWidth));
 
   const recent = task.recentCalls ?? [];
   const slice = recent.slice(-MAX_TOOL_LINES);
   slice.forEach((tc, idx) => {
     const connector = idx === slice.length - 1 ? TREE_LAST : TREE_MIDDLE;
-    const detail = tc.detail ? `  ${tc.detail}` : "";
+    const toolName = sanitizeWidgetText(tc.name);
+    const toolDetail = sanitizeWidgetText(tc.detail);
+    const detail = toolDetail ? `  ${toolDetail}` : "";
     const line =
       "  " +
       color(theme, "dim", connector) +
       " " +
       toolStatusMark(theme, tc.status, spinner) +
       " " +
-      color(theme, "text", tc.name) +
+      color(theme, "text", toolName) +
       color(theme, "dim", detail);
-    lines.push(truncateToWidth(line, maxWidth));
+    lines.push(truncateWidgetLine(line, maxWidth));
   });
 
   return lines;
@@ -133,18 +155,20 @@ function renderBackgroundLine(
 ): string {
   const elapsed = formatMs(now - task.startedAt);
   const latest = formatLatestTool(task, spinner, theme);
+  const agentType = sanitizeWidgetText(task.agentType);
+  const taskId = sanitizeWidgetText(id);
   const line =
     color(theme, "dim", "- ") +
-    color(theme, "toolTitle", task.agentType) +
+    color(theme, "toolTitle", agentType) +
     color(theme, "dim", " \u00b7 ") +
-    color(theme, "accent", id) +
+    color(theme, "accent", taskId) +
     color(theme, "dim", " \u00b7 ") +
     color(theme, "warning", elapsed) +
     color(theme, "dim", " \u00b7 ") +
     color(theme, "success", formatToolCount(task.toolUses)) +
     color(theme, "dim", " \u00b7 ") +
     latest;
-  return truncateToWidth(line, maxWidth);
+  return truncateWidgetLine(line, maxWidth);
 }
 
 export function renderTaskWidget(params: {
@@ -190,7 +214,7 @@ export function renderTaskWidget(params: {
   const hidden = backgroundCount - renderedBackground.length;
   if (hidden > 0) {
     lines.push(
-      truncateToWidth(
+      truncateWidgetLine(
         color(theme, "dim", `+ ${hidden} more background tasks`),
         maxWidth,
       ),
